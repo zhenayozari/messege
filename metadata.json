@@ -1,0 +1,6 @@
+{
+  "name": "Phoenix AI Hub",
+  "description": "SMM-панель и CRM для работы в одно окно с поддержкой ВК, Telegram, Max и AI-ассистентом",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
