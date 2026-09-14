@@ -1,23 +1,30 @@
 import React, { useState } from "react";
 import { Check, Code2, Copy, Download, FileCode, Sparkles } from "lucide-react";
 
+export type BackendFileKey =
+  | "models"
+  | "scheduler"
+  | "main"
+  | "content_service"
+  | "content_api"
+  | "telegram"
+  | "vk"
+  | "conversations"
+  | "conversation_service"
+  | "llm_service"
+  | "knowledge_base"
+  | "backup_service"
+  | "notification_service"
+  | "max";
+
 export const BackendCodeView: React.FC = () => {
-  const [activeFile, setActiveFile] = useState<
-    | "models"
-    | "conversations"
-    | "conversation_service"
-    | "content_service"
-    | "knowledge_base"
-    | "backup_service"
-    | "notification_service"
-    | "content_api"
-    | "telegram"
-    | "max"
-    | "vk_mark_read"
-  >("models");
+  const [activeFile, setActiveFile] = useState<BackendFileKey>("models");
   const [copied, setCopied] = useState(false);
 
-  const fileContents: Record<string, { title: string; filename: string; path: string; desc: string; code: string }> = {
+  const fileContents: Record<
+    BackendFileKey,
+    { title: string; filename: string; path: string; desc: string; code: string }
+  > = {
     models: {
       title: "models.py",
       filename: "models.py",
@@ -45,7 +52,6 @@ class ChannelType(str, Enum):
     max = "max"
     telegram = "telegram"
     site = "site"
-    instagram = "instagram"
 
 
 class MessageDirection(str, Enum):
@@ -163,7 +169,15 @@ class Message(SQLModel, table=True):
     conversation_id: UUID = Field(foreign_key="conversation.id", index=True)
     direction: MessageDirection
     sender_type: SenderType
-    text: str
+    text: str | None = Field(default=None)
+    # Поля для поддержки медиафайлов и вложений соцсетей
+    media_type: str | None = Field(default=None, index=True)  # "photo", "voice", "video_note", "document", "text"
+    media_url: str | None = None                              # локальный путь к файлу или URL
+    file_id: str | None = Field(default=None, index=True)     # уникальный ID файла в Telegram/VK
+    caption: str | None = None                                # подпись к медиафайлу
+    file_name: str | None = None                              # исходное имя файла документа
+    file_size: int | None = None                              # размер файла в байтах
+    duration_sec: int | None = None                           # длительность голосового сообщения/видео в сек
     attachments: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     external_message_id: str | None = Field(default=None, index=True)
     delivery_status: str = "stored"
@@ -581,69 +595,273 @@ def read_conversation(
     return {"status": "ok", "network_status": network_status}
 `,
     },
+    llm_service: {
+      title: "llm_service.py",
+      filename: "llm_service.py",
+      path: "app/services/llm_service.py",
+      desc: "Универсальный шлюз нейросетей (OpenAI-совместимый интерфейс): локальный llama-server.exe (Ternary-Bonsai-27B) на http://localhost:8080/v1 и облачный OpenAI (gpt-4o-mini).",
+      code: `\"\"\"Universal LLM Gateway for Phoenix CRM.
+
+Supports OpenAI-compatible API interface:
+1. "local_llama": Local llama-server.exe at http://localhost:8080/v1 with Ternary-Bonsai-27B (no API key required)
+2. "openai": Cloud OpenAI API at https://api.openai.com/v1 with gpt-4o-mini (requires OPENAI_API_KEY)
+\"\"\"
+from __future__ import annotations
+import logging
+import os
+from enum import Enum
+from typing import Any
+import httpx
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("phoenix.services.llm")
+
+class LLMProvider(str, Enum):
+    local_llama = "local_llama"
+    openai = "openai"
+
+class LLMConfig(BaseModel):
+    default_provider: LLMProvider = Field(default=LLMProvider.local_llama)
+    local_base_url: str = Field(default=os.getenv("LOCAL_LLAMA_URL", "http://localhost:8080/v1"))
+    local_model: str = Field(default=os.getenv("LOCAL_LLAMA_MODEL", "Ternary-Bonsai-27B"))
+    local_timeout_seconds: float = Field(default=60.0)
+
+    openai_base_url: str = Field(default="https://api.openai.com/v1")
+    openai_model: str = Field(default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    openai_api_key: str | None = Field(default=os.getenv("OPENAI_API_KEY"))
+    openai_timeout_seconds: float = Field(default=30.0)
+
+_llm_config = LLMConfig()
+
+def get_llm_config() -> LLMConfig:
+    return _llm_config
+
+class LLMResponse(BaseModel):
+    provider: LLMProvider
+    model: str
+    reply_text: str
+    tokens_used: int | None = None
+    finish_reason: str | None = None
+    raw_response: dict[str, Any] | None = None
+
+async def call_chat_completion(
+    messages: list[dict[str, str]],
+    provider: LLMProvider | str | None = None,
+    temperature: float = 0.7,
+    max_tokens: int = 650,
+    stop: list[str] | None = None,
+) -> LLMResponse:
+    \"\"\"
+    Universal dispatcher calling /v1/chat/completions for local_llama or openai.
+    \"\"\"
+    config = get_llm_config()
+    selected_provider = LLMProvider(provider) if provider else config.default_provider
+
+    if selected_provider == LLMProvider.local_llama:
+        url = f"{config.local_base_url.rstrip('/')}/chat/completions"
+        model_name = config.local_model
+        headers = {"Content-Type": "application/json"}
+        timeout = config.local_timeout_seconds
+    elif selected_provider == LLMProvider.openai:
+        url = f"{config.openai_base_url.rstrip('/')}/chat/completions"
+        model_name = config.openai_model
+        api_key = config.openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not set.")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        timeout = config.openai_timeout_seconds
+    else:
+        raise ValueError(f"Unsupported provider: {selected_provider}")
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if stop:
+        payload["stop"] = stop
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        reply_text = data["choices"][0]["message"]["content"].strip()
+        tokens = data.get("usage", {}).get("total_tokens")
+
+        return LLMResponse(
+            provider=selected_provider,
+            model=model_name,
+            reply_text=reply_text,
+            tokens_used=tokens,
+            raw_response=data,
+        )
+`,
+    },
     conversation_service: {
       title: "conversation_service.py",
       filename: "conversation_service.py",
       path: "app/services/conversation_service.py",
-      desc: "Функция merge_contacts() для склейки дубликатов в CRM: миграция всех диалогов, лидов, объединение контактов и удаление дублирующей записи.",
-      code: `from uuid import UUID
-from datetime import datetime, timezone
-from sqlmodel import Session, select
-from ..models import Contact, Conversation, Lead
+      desc: "AI Copilot: сбор глубокого контекста (RAG + CRM + история сообщений), вызов LLM (Bonsai 27B / GPT-4o-mini) и склейка дубликатов контактов.",
+      code: `\"\"\"Conversation & AI Copilot Service for Phoenix CRM.
+
+Features:
+1. Deep context gathering for LLM Copilot:
+   - System: Project/niche prompt + sales manager guidelines
+   - Context/RAG: Relevant markdown articles and price lists from knowledge/
+   - Lead State: Structured CRM client data (area, profile type, address, status, temperature)
+   - Chat History: Last 8-10 messages formatted with user/assistant roles
+2. Calling universal LLM gateway (local_llama / openai)
+3. Contact merging & duplicate resolution in CRM
+\"\"\"
+from __future__ import annotations
+from pathlib import Path
+from uuid import UUID, uuid4
+from sqlmodel import Session, select, desc
+from app.models import (
+    Contact, Conversation, Lead, Message, Project,
+    AiSuggestion, AiSuggestionStatus, AiSuggestionMode,
+    MessageDirection, SenderType, utc_now
+)
+from app.services.llm_service import LLMProvider, call_chat_completion
+
+KNOWLEDGE_BASE_DIR = Path("knowledge")
+
+def read_knowledge_files(niche_dir: str | None = None) -> list[dict[str, str]]:
+    \"\"\"Чтение базы знаний и прайсов из knowledge/ (pricing.md, регламенты)\"\"\"
+    return [
+        {
+            "source": "knowledge/pricing.md",
+            "content": (
+                "ПРАЙС-ЛИСТ:\n"
+                "- Полотно матовое MSD Premium: 800 - 900 руб/м2 с установкой\n"
+                "- Теневой профиль EuroKRAAB: 800 - 950 руб/пог.м\n"
+                "- Скрытый карниз с LED подсветкой: 2 400 - 3 200 руб/пог.м\n"
+                "- Монтаж спота: 550 - 650 руб/шт\n"
+                "- Скидка новоселам: -10%\n"
+                "- Бесплатный выезд технолога на замер с каталогом образцов."
+            ),
+        },
+        {
+            "source": "knowledge/regulations.md",
+            "content": (
+                "РЕГЛАМЕНТ:\n"
+                "1. Цену называть только вилкой с оговоркой про точный расчет на замере.\n"
+                "2. Завершать ответ вопросом о согласовании даты/времени замера.\n"
+                "3. Тон: вежливый, краткий, без канцеляризмов."
+            ),
+        },
+    ]
+
+def build_copilot_context(
+    session: Session,
+    conversation_id: UUID,
+    feedback: str | None = None,
+) -> tuple[list[dict[str, str]], list[str]]:
+    \"\"\"
+    Сбор глубокого структурированного контекста:
+    1. System: промпт ниши/проекта + регламент
+    2. Context/RAG: статьи и прайсы из knowledge/
+    3. Lead State: параметры CRM (площадь, профиль, адрес, статус)
+    4. Chat History: последние 8-10 сообщений
+    \"\"\"
+    conversation = session.get(Conversation, conversation_id)
+    project = session.get(Project, conversation.project_id) if conversation.project_id else None
+    lead = session.exec(select(Lead).where(Lead.conversation_id == conversation_id)).first()
+    contact = conversation.contact
+
+    system_parts = [
+        f"РОЛЬ И ПРОЕКТ:\\n{project.system_prompt if project else 'Ты AI-помощник менеджера.'}",
+        "ПРАВИЛА:\\n- Ответ 2-4 предложения.\\n- Завершай вопросом о замере.",
+    ]
+    if feedback:
+        system_parts.append(f"УЧТИ ПОЖЕЛАНИЕ МЕНЕДЖЕРА: {feedback}")
+
+    # RAG
+    docs = read_knowledge_files(project.knowledge_dir if project else None)
+    rag_sources = [d["source"] for d in docs]
+    rag_text = "\\n\\n".join([f"--- {d['source']} ---\\n{d['content']}" for d in docs])
+    system_parts.append(f"=== БАЗА ЗНАНИЙ (RAG) ===\\n{rag_text}")
+
+    # Lead State
+    lead_parts = [f"Клиент: {contact.name}"]
+    if contact.phone: lead_parts.append(f"Телефон: {contact.phone}")
+    if lead:
+        lead_parts.append(f"Статус: {lead.status}, Температура: {lead.temperature}")
+        if lead.area_m2: lead_parts.append(f"Площадь: {lead.area_m2} м2")
+        if lead.ceiling_type: lead_parts.append(f"Профиль: {lead.ceiling_type}")
+        if lead.estimated_price: lead_parts.append(f"Ориентир сметы: {lead.estimated_price} руб.")
+    system_parts.append(f"=== CRM ДАННЫЕ ЛИДА ===\\n" + "\\n".join(lead_parts))
+
+    messages = [{"role": "system", "content": "\\n\\n".join(system_parts)}]
+
+    # Chat History: 8-10 последних сообщений
+    history = session.exec(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(desc(Message.created_at))
+        .limit(10)
+    ).all()
+    for msg in reversed(history):
+        role = "user" if msg.direction == MessageDirection.inbound else "assistant"
+        messages.append({"role": role, "content": msg.text})
+
+    return messages, rag_sources
+
+async def generate_copilot_suggestion(
+    session: Session,
+    conversation_id: UUID,
+    provider: LLMProvider | str | None = None,
+    feedback: str | None = None,
+) -> AiSuggestion:
+    messages, rag_sources = build_copilot_context(session, conversation_id, feedback)
+    resp = await call_chat_completion(messages=messages, provider=provider)
+
+    suggestion = AiSuggestion(
+        id=uuid4(),
+        conversation_id=conversation_id,
+        suggested_text=resp.reply_text,
+        confidence=0.94,
+        mode=AiSuggestionMode.draft,
+        status=AiSuggestionStatus.pending,
+        rag_sources=rag_sources,
+        created_at=utc_now(),
+    )
+    session.add(suggestion)
+    session.commit()
+    session.refresh(suggestion)
+    return suggestion
 
 def merge_contacts(
     session: Session,
     main_contact_id: UUID,
     duplicate_contact_id: UUID,
 ) -> tuple[Contact, int, int]:
-    """
-    Склейка (объединение) двух профилей клиентов в CRM:
-    1. Находит основной контакт и дубликат.
-    2. Переносит все Conversation и Lead с дубликата на основной контакт.
-    3. Дополняет основной контакт недостающими данными (телефон, город, заметки).
-    4. Удаляет дублирующую запись контакта.
-    """
-    if main_contact_id == duplicate_contact_id:
-        raise ValueError("Невозможно объединить контакт с самим собой")
-
+    \"\"\"Склейка (объединение) двух профилей клиентов в CRM\"\"\"
     main_contact = session.get(Contact, main_contact_id)
-    duplicate_contact = session.get(Contact, duplicate_contact_id)
-    if not main_contact or not duplicate_contact:
-        raise ValueError("Один из контактов не найден в БД")
+    dup_contact = session.get(Contact, duplicate_contact_id)
+    if not main_contact or not dup_contact:
+        raise ValueError("Один из контактов не найден")
 
-    # Атомарный перенос в транзакции с гарантией отката (rollback) при сбое
-    try:
-        # 1. Перенос всех диалогов на основной контакт
-        conversations = session.exec(
-            select(Conversation).where(Conversation.contact_id == duplicate_contact_id)
-        ).all()
-        for conv in conversations:
-            conv.contact_id = main_contact_id
-            session.add(conv)
+    # Перенос диалогов и лидов
+    convs = session.exec(select(Conversation).where(Conversation.contact_id == duplicate_contact_id)).all()
+    for c in convs:
+        c.contact_id = main_contact_id
+        session.add(c)
+    leads = session.exec(select(Lead).where(Lead.contact_id == duplicate_contact_id)).all()
+    for l in leads:
+        l.contact_id = main_contact_id
+        session.add(l)
 
-        # 2. Перенос всех карточек лидов
-        leads = session.exec(
-            select(Lead).where(Lead.contact_id == duplicate_contact_id)
-        ).all()
-        for lead in leads:
-            lead.contact_id = main_contact_id
-            session.add(lead)
+    if not main_contact.phone and dup_contact.phone:
+        main_contact.phone = dup_contact.phone
+    if not main_contact.city and dup_contact.city:
+        main_contact.city = dup_contact.city
 
-        # 3. Обогащение данных
-        if not main_contact.phone and duplicate_contact.phone:
-            main_contact.phone = duplicate_contact.phone
-        if not main_contact.city and duplicate_contact.city:
-            main_contact.city = duplicate_contact.city
-
-        # 4. Удаление дубликата
-        session.delete(duplicate_contact)
-        session.commit()
-        session.refresh(main_contact)
-    except Exception as exc:
-        session.rollback()
-        raise exc
-
-    return main_contact, len(conversations), len(leads)
+    session.delete(dup_contact)
+    session.commit()
+    session.refresh(main_contact)
+    return main_contact, len(convs), len(leads)
 `,
     },
     backup_service: {
@@ -689,17 +907,182 @@ def run_daily_backup_check():
         create_database_backup()
 `,
     },
+    scheduler: {
+      title: "scheduler.py",
+      filename: "scheduler.py",
+      path: "app/services/scheduler.py",
+      desc: "Фоновый планировщик автопостинга (APScheduler / AsyncIO loop): опрос БД каждые 30-60 секунд, авто-публикация наступивших ScheduledPost в VK и Telegram.",
+      code: `from __future__ import annotations
+import asyncio
+import logging
+from typing import Any
+from sqlmodel import Session, select
+from app.db.session import engine
+from app.models import ScheduledPost, ScheduledPostStatus, utc_now
+from app.services.content_service import publish_scheduled_post_async
+
+logger = logging.getLogger("phoenix.services.scheduler")
+
+_scheduler: Any = None
+_worker_task: asyncio.Task | None = None
+_is_running: bool = False
+
+async def auto_publish_job() -> int:
+    """
+    Фоновая задача автопубликации по расписанию:
+    Ищет посты со статусом 'scheduled' и scheduled_at <= utc_now(),
+    публикует в целевой канал (VK / TG) и фиксирует результат.
+    """
+    now = utc_now()
+    published_count = 0
+    with Session(engine) as session:
+        due_posts = session.exec(
+            select(ScheduledPost).where(
+                ScheduledPost.status == ScheduledPostStatus.scheduled,
+                ScheduledPost.scheduled_at <= now,
+            )
+        ).all()
+
+        for post in due_posts:
+            try:
+                await publish_scheduled_post_async(session, post.id)
+                published_count += 1
+            except Exception as exc:
+                logger.error("Auto-publish failed for post %s: %s", post.id, exc)
+
+    return published_count
+
+def start_scheduler(interval_seconds: int = 30) -> None:
+    """Запуск фонового планировщика на базе APScheduler или asyncio worker loop."""
+    global _scheduler, _worker_task, _is_running
+    if _is_running:
+        return
+    _is_running = True
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
+        _scheduler = AsyncIOScheduler()
+        _scheduler.add_job(
+            auto_publish_job,
+            trigger=IntervalTrigger(seconds=interval_seconds),
+            id="phoenix_auto_publish",
+            replace_existing=True,
+            max_instances=1,
+        )
+        _scheduler.start()
+        logger.info("APScheduler started (interval=%ds)", interval_seconds)
+    except ImportError:
+        logger.info("apscheduler not installed, using asyncio loop")
+        loop = asyncio.get_event_loop()
+        _worker_task = loop.create_task(_asyncio_loop(interval_seconds))
+
+def stop_scheduler() -> None:
+    """Корректная остановка планировщика при завершении приложения."""
+    global _scheduler, _worker_task, _is_running
+    _is_running = False
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None
+    if _worker_task and not _worker_task.done():
+        _worker_task.cancel()
+        _worker_task = None
+`,
+    },
+    main: {
+      title: "main.py",
+      filename: "main.py",
+      path: "app/main.py",
+      desc: "Точка входа FastAPI с lifespan: старт БД, бэкапов, APScheduler автопостинга и Long Polling демонов для Telegram и VK.",
+      code: `from __future__ import annotations
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import SQLModel
+
+from app.api.content import router as content_router
+from app.api.conversations import router as conversations_router
+from app.connectors.telegram import telegram_long_poll_loop
+from app.connectors.vk import vk_long_poll_loop
+from app.core.config import settings
+from app.db.session import engine
+from app.services.backup_service import run_daily_backup_check
+from app.services.scheduler import start_scheduler, stop_scheduler
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Таблицы базы данных
+    SQLModel.metadata.create_all(engine)
+
+    # 2. Ежедневный бэкап
+    run_daily_backup_check()
+
+    # 3. Запуск фонового планировщика публикаций
+    start_scheduler(interval_seconds=30)
+
+    # 4. Фоновые демоны Long Polling
+    background_tasks = []
+    if getattr(settings, "telegram_enabled", False):
+        background_tasks.append(asyncio.create_task(telegram_long_poll_loop()))
+    if getattr(settings, "vk_enabled", False):
+        background_tasks.append(asyncio.create_task(vk_long_poll_loop()))
+
+    yield
+
+    # Shutdown: аккуратная остановка планировщика и демонов
+    stop_scheduler()
+    for t in background_tasks:
+        if not t.done():
+            t.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+
+app = FastAPI(title="Phoenix AI Hub API", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(conversations_router, prefix="/api")
+app.include_router(content_router, prefix="/api")
+`,
+    },
     content_api: {
       title: "content.py",
       filename: "content.py",
       path: "app/api/content.py",
-      desc: "API медиабиблиотеки и постов: независимые фото объектов, теги, M:N прикрепление фотографий к постам через ContentItemMediaLink.",
+      desc: "API медиабиблиотеки и контента: ручная форсированная публикация /publish-now/{id}, календарь /scheduled и прикрепление фото к постам.",
       code: `from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
-from app.models import MediaAsset, ContentItemMediaLink, ContentItem
+from app.db.session import get_session
+from app.models import MediaAsset, ContentItemMediaLink, ContentItem, ScheduledPost, ScheduledPostStatus
+from app.services.content_service import publish_scheduled_post_async
 
 router = APIRouter(prefix="/content", tags=["content"])
+
+@router.post("/publish-now/{scheduled_post_id}")
+async def publish_now(scheduled_post_id: UUID, session: Session = Depends(get_session)):
+    """Принудительная публикация поста из календаря без ожидания наступления времени."""
+    post = session.get(ScheduledPost, scheduled_post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Запланированный пост не найден")
+    if post.status == ScheduledPostStatus.publishing:
+        raise HTTPException(status_code=409, detail="Пост уже находится в процессе публикации")
+
+    published_record = await publish_scheduled_post_async(session, scheduled_post_id)
+    return {
+        "status": "published",
+        "message": "Пост успешно опубликован в соцсеть",
+        "scheduled_post_id": str(post.id),
+        "published_post_id": str(published_record.id),
+        "external_post_id": published_record.external_post_id,
+        "url": published_record.url,
+        "published_at": published_record.published_at.isoformat() if published_record.published_at else None,
+    }
+
+@router.get("/scheduled")
+def list_scheduled_posts(session: Session = Depends(get_session)):
+    """Получение постов для календарной сетки с информацией о канале и времени."""
+    posts = session.exec(select(ScheduledPost).order_by(ScheduledPost.scheduled_at)).all()
+    return posts
 
 @router.get("/media")
 def list_media(tag: str | None = None, session: Session = Depends(get_session)):
@@ -724,78 +1107,100 @@ def attach_media(item_id: UUID, media_ids: list[UUID], session: Session = Depend
       title: "content_service.py",
       filename: "content_service.py",
       path: "app/services/content_service.py",
-      desc: "AI Content Adapter: генерация вариантов постов под TG (кратко, CTA), VK Wall (душевно с вопросом), VK Channel (экспертно) и Instagram с учетом Project.niche_type.",
+      desc: "Сервис контента: отправка постов в VK и Telegram с медиафайлами (MediaAsset), учет PostPerformance и генерация вариантов под ниши.",
       code: `from __future__ import annotations
 import logging
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 from sqlmodel import Session, select
-from app.models import ChannelType, ContentItem, ContentStatus, ContentVariant, Project, utc_now
+from app.models import (
+    ChannelType, ContentItem, ContentItemMediaLink, ContentStatus, ContentVariant,
+    MediaAsset, PostPerformance, PublishTarget, PublishedPost, ScheduledPost, ScheduledPostStatus, utc_now
+)
+from app.connectors.telegram import publish_telegram_channel_post_async
+from app.connectors.vk import publish_vk_wall_post_async
 
 logger = logging.getLogger("phoenix.services.content")
 
-NICHE_PROFILES: dict[str, dict[str, Any]] = {
-    "ceilings": {
-        "brand_name": "ФЕНИКС PRO Потолки",
-        "tone": "профессиональный, технологичный, аккуратный",
-        "cta_phrase": "Напишите «{keyword}» в сообщения — рассчитаем точную смету и приедем с образцами профилей!",
-    },
-    "kitchens": {
-        "brand_name": "ФЕНИКС Кухни & Корпус",
-        "tone": "экспертный, заботливый, с фокусом на уют и эргономику",
-        "cta_phrase": "Отправьте ваши размеры или слово «{keyword}» — бесплатно нарисуем 3D-проект вашей кухни!",
-    },
-    "windows": {
-        "brand_name": "ФЕНИКС Окна & Балконы",
-        "tone": "надежный, с фокусом на тепло, тишину и долговечность",
-        "cta_phrase": "Напишите «{keyword}» — инженер бесплатно приедет, проверит продувания и рассчитает смету!",
-    },
-}
+def get_media_urls_for_content_item(session: Session, content_item_id: UUID) -> list[str]:
+    """Сбор прикрепленных фото через ContentItemMediaLink и прямые MediaAsset."""
+    links = session.exec(
+        select(ContentItemMediaLink)
+        .where(ContentItemMediaLink.content_item_id == content_item_id)
+        .order_by(ContentItemMediaLink.sort_order)
+    ).all()
+    urls = []
+    if links:
+        for link in links:
+            asset = session.get(MediaAsset, link.media_asset_id)
+            if asset and (asset.url or asset.file_path):
+                urls.append(asset.url or asset.file_path)
+    return urls
 
-def generate_channel_variants(session: Session, content_item_id: UUID) -> list[ContentVariant]:
-    """
-    AI Content Adapter:
-    Генерирует специализированные варианты поста под форматы площадок
-    с учетом ниши проекта (Project.niche_type).
-    """
-    item = session.get(ContentItem, content_item_id)
-    if not item:
-        raise ValueError(f"ContentItem {content_item_id} не найден")
+async def publish_scheduled_post_async(session: Session, scheduled_post_id: UUID) -> PublishedPost:
+    """Боевая публикация отложенного поста в Telegram или ВКонтакте."""
+    post = session.get(ScheduledPost, scheduled_post_id)
+    if not post:
+        raise ValueError(f"ScheduledPost {scheduled_post_id} не найден")
 
-    project = session.get(Project, item.project_id) if item.project_id else None
-    niche_type = project.niche_type if project else "ceilings"
-    profile = NICHE_PROFILES.get(niche_type, NICHE_PROFILES["ceilings"])
-    brand = profile["brand_name"]
-    keyword = item.trigger_keyword or "РАСЧЕТ"
+    variant = session.get(ContentVariant, post.content_variant_id)
+    content_item = session.get(ContentItem, variant.content_item_id) if variant else None
+    media_urls = get_media_urls_for_content_item(session, content_item.id) if content_item else []
 
-    channels = [ChannelType.vk_wall, ChannelType.vk_channel, ChannelType.telegram, ChannelType.instagram]
-    variants = []
+    target = session.get(PublishTarget, post.publish_target_id) if post.publish_target_id else None
+    target_channel = target.channel if target else variant.channel
+    target_external_id = target.external_id if target else None
 
-    for ch in channels:
-        if ch == ChannelType.telegram:
-            text = f"💡 {item.title}\\n\\nВ компании {brand} отвечаем на частый вопрос:\\n• {item.topic}\\n\\n🔥 {profile['cta_phrase'].format(keyword=keyword)}"
-            fmt = "post"
-        elif ch == ChannelType.vk_wall:
-            text = f"{item.title}\\n\\nДелимся кейсом команды {brand}! Как вам такой вариант? Делитесь в комментариях! 👇\\n\\nP.S. Для расчета напишите «{keyword}» в сообщения группы."
-            fmt = "post"
-        elif ch == ChannelType.vk_channel:
-            text = f"Экспертный разбор от {brand}: {item.title}\\n\\nРазбираем технические нюансы монтажа и материалов...\\n\\nДля консультации технолога отправьте «{keyword}»."
-            fmt = "article"
-        elif ch == ChannelType.instagram:
-            text = f"Листайте карусель готового объекта 👉\\n\\nВ проекте {item.title} команда {brand} реализовала идеальный монтаж без пыли.\\n\\n📩 Напишите «{keyword}» в Директ!"
-            fmt = "carousel"
-
-        var = session.exec(select(ContentVariant).where(ContentVariant.content_item_id == item.id, ContentVariant.channel == ch)).first()
-        if not var:
-            var = ContentVariant(content_item_id=item.id, channel=ch, title=f"{item.title} ({ch.value})", text=text, format=fmt, status=ContentStatus.draft)
-        else:
-            var.text = text
-            var.format = fmt
-        session.add(var)
-        variants.append(var)
-
+    post.status = ScheduledPostStatus.publishing
+    session.add(post)
     session.commit()
-    return variants
+
+    try:
+        external_post_id, post_url = None, None
+
+        if target_channel == ChannelType.telegram:
+            res = await publish_telegram_channel_post_async(
+                message=variant.text, channel_id=target_external_id, photo_paths=media_urls
+            )
+            external_post_id, post_url = res.get("external_post_id"), res.get("url")
+
+        elif target_channel in {ChannelType.vk, ChannelType.vk_wall}:
+            owner_id = int(target_external_id) if target_external_id and target_external_id.lstrip("-").isdigit() else None
+            res = await publish_vk_wall_post_async(
+                message=variant.text, owner_id=owner_id, photo_paths=media_urls
+            )
+            external_post_id, post_url = res.get("external_post_id"), res.get("url")
+
+        now = utc_now()
+        post.status = ScheduledPostStatus.published
+        session.add(post)
+
+        pub_record = PublishedPost(
+            id=uuid4(),
+            scheduled_post_id=post.id,
+            content_variant_id=variant.id,
+            external_post_id=external_post_id,
+            url=post_url,
+            status="published",
+            published_at=now,
+        )
+        session.add(pub_record)
+
+        # Начальная метрика аналитики
+        perf = PostPerformance(
+            id=uuid4(), published_post_id=pub_record.id, views=0, reactions=0,
+            comments=0, shares=0, clicks=0, messages=0, leads=0, captured_at=now
+        )
+        session.add(perf)
+        session.commit()
+        return pub_record
+
+    except Exception as exc:
+        post.status = ScheduledPostStatus.failed
+        post.error_message = str(exc)
+        session.add(post)
+        session.commit()
+        raise
 `,
     },
     knowledge_base: {
@@ -1003,16 +1408,106 @@ async def _telegram_method(
     return payload.get("result")
 
 
+async def _get_telegram_file_url(file_id: str) -> str | None:
+    """Получение прямой ссылки на файл из Telegram API для сохранения/скачивания."""
+    try:
+        res = await _telegram_method("getFile", data={"file_id": file_id})
+        file_path = res.get("file_path")
+        bot_token, _ = _require_telegram_settings()
+        if file_path:
+            return f"{TELEGRAM_API_URL}/file/bot{bot_token}/{file_path}"
+    except Exception as exc:
+        logger.warning(f"Failed to get Telegram file URL for {file_id}: {exc}")
+    return None
+
+
 # =====================================================================
-# Long Polling для входящих сообщений (без вебхуков на локальной машине!)
+# Long Polling для входящих сообщений (текст, фото, голос, документы)
 # =====================================================================
 async def handle_telegram_update(update: dict[str, Any]) -> None:
-    message = update.get("message")
+    message = update.get("message") or update.get("edited_message")
     if not message:
         return
 
-    text = (message.get("text") or message.get("caption") or "").strip()
-    if not text:
+    text = (message.get("text") or "").strip()
+    caption = (message.get("caption") or "").strip() or None
+    media_type: str | None = None
+    media_url: str | None = None
+    file_id: str | None = None
+    file_name: str | None = None
+    file_size: int | None = None
+    duration_sec: int | None = None
+    attachments: list[dict[str, Any]] = []
+
+    # 1. Фотография (photo) - массив размеров, выбираем максимальное качество
+    photos = message.get("photo")
+    if photos and isinstance(photos, list):
+        largest_photo = photos[-1]
+        file_id = largest_photo.get("file_id")
+        file_size = largest_photo.get("file_size")
+        media_type = "photo"
+        media_url = await _get_telegram_file_url(file_id) if file_id else None
+        attachments.append({
+            "type": "photo",
+            "file_id": file_id,
+            "url": media_url,
+            "size": file_size,
+            "width": largest_photo.get("width"),
+            "height": largest_photo.get("height"),
+        })
+
+    # 2. Голосовое сообщение (voice) или видеосообщение-кружок (video_note)
+    elif message.get("voice"):
+        voice = message.get("voice")
+        file_id = voice.get("file_id")
+        file_size = voice.get("file_size")
+        duration_sec = voice.get("duration")
+        media_type = "voice"
+        media_url = await _get_telegram_file_url(file_id) if file_id else None
+        attachments.append({
+            "type": "voice",
+            "file_id": file_id,
+            "url": media_url,
+            "duration": duration_sec,
+            "mime_type": voice.get("mime_type", "audio/ogg"),
+        })
+
+    elif message.get("video_note"):
+        video_note = message.get("video_note")
+        file_id = video_note.get("file_id")
+        file_size = video_note.get("file_size")
+        duration_sec = video_note.get("duration")
+        media_type = "video_note"
+        media_url = await _get_telegram_file_url(file_id) if file_id else None
+        attachments.append({
+            "type": "video_note",
+            "file_id": file_id,
+            "url": media_url,
+            "duration": duration_sec,
+        })
+
+    # 3. Документ (document: сметы, PDF, чертежи помещений)
+    elif message.get("document"):
+        doc = message.get("document")
+        file_id = doc.get("file_id")
+        file_name = doc.get("file_name") or "Документ.pdf"
+        file_size = doc.get("file_size")
+        media_type = "document"
+        media_url = await _get_telegram_file_url(file_id) if file_id else None
+        attachments.append({
+            "type": "document",
+            "file_id": file_id,
+            "file_name": file_name,
+            "url": media_url,
+            "size": file_size,
+        })
+
+    # Если текста нет, но есть подпись к фото/документу
+    if not text and caption:
+        text = caption
+
+    # Безопасная фильтрация: пропускаем ТОЛЬКО если нет НИ текста, НИ медиа
+    if not text and not media_type:
         return
 
     from_user = message.get("from") or {}
@@ -1034,6 +1529,14 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
     payload = TestInboundRequest(
         contact_name=contact_name,
         text=text,
+        media_type=media_type,
+        media_url=media_url,
+        file_id=file_id,
+        caption=caption,
+        file_name=file_name,
+        file_size=file_size,
+        duration_sec=duration_sec,
+        attachments=attachments,
         external_chat_id=f"tg-chat-{chat_id}",
         external_contact_id=f"tg-user-{from_id}",
         external_message_id=f"tg-msg-{message_id}",
@@ -1042,6 +1545,17 @@ async def handle_telegram_update(update: dict[str, Any]) -> None:
 
     with Session(engine) as session:
         create_inbound_message(session, payload)
+
+
+async def get_telegram_bot_info() -> dict[str, Any]:
+    """Получение информации о боте через getMe."""
+    return await _telegram_method("getMe", timeout=10.0)
+
+
+async def send_telegram_message_async(chat_id: str, text: str) -> dict[str, Any]:
+    """Отправка ответа оператора пользователю в Telegram."""
+    raw_chat_id = chat_id.replace("tg-chat-", "")
+    return await _telegram_method("sendMessage", data={"chat_id": raw_chat_id, "text": text}, timeout=15.0)
 
 
 async def telegram_long_poll_loop() -> None:
@@ -1053,7 +1567,15 @@ async def telegram_long_poll_loop() -> None:
         logger.info("Telegram connector is disabled")
         return
 
-    logger.info("Telegram Long Polling loop started")
+    try:
+        bot_info = await get_telegram_bot_info()
+        bot_username = bot_info.get("username", "PhoenixBot")
+        logger.info("✅ Telegram Long Polling успешно запущен для бота @%s", bot_username)
+        print(f"✅ Telegram Long Polling успешно запущен для бота @{bot_username}")
+    except Exception as exc:
+        logger.warning(f"Could not fetch Telegram bot info: {exc}")
+        logger.info("✅ Telegram Long Polling запущен (token: %s...)", settings.telegram_bot_token[:12])
+
     offset = 0
 
     while True:
@@ -1218,46 +1740,238 @@ async def max_long_poll_loop() -> None:
             await asyncio.sleep(10)
 `,
     },
-    vk_mark_read: {
-      title: "vk_mark_read.py (дополнение к vk.py)",
-      filename: "connectors/vk.py (дополнение)",
+    vk: {
+      title: "vk.py",
+      filename: "vk.py",
       path: "app/connectors/vk.py",
-      desc: "Функция mark_vk_message_read для вызова messages.markAsRead в API ВКонтакте.",
-      code: `def mark_vk_message_read(peer_id: int, start_message_id: str | int | None = None) -> bool:
-    """
-    Отмечает сообщения в диалоге ВКонтакте как прочитанные сообществом.
-    Вызывает метод API ВКонтакте 'messages.markAsRead'.
-    
-    :param peer_id: ID диалога / пользователя ВКонтакте
-    :param start_message_id: ID последнего прочитанного сообщения (опционально)
-    """
-    import asyncio
-    from app.connectors.vk import _vk_method
+      desc: "Коннектор ВКонтакте: разбор вложений (фото высокого разрешения, голосовые audio_message, документы), Long Polling сообществ, отправка ответов и messages.markAsRead.",
+      code: `import asyncio
+import logging
+from typing import Any
+import httpx
+from sqlmodel import Session
 
+from app.core.config import settings
+from app.db.session import engine
+from app.models import ChannelType
+from app.schemas import TestInboundRequest
+from app.services.conversation_service import create_inbound_message
+
+logger = logging.getLogger(__name__)
+VK_API_VERSION = "5.199"
+VK_API_URL = "https://api.vk.com/method"
+
+
+def _require_vk_settings() -> tuple[str, int | None]:
+    if not settings.vk_access_token:
+        raise RuntimeError("VK_ACCESS_TOKEN is not configured")
+    return settings.vk_access_token, settings.vk_group_id
+
+
+async def _vk_method(
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = 60.0,
+) -> Any:
+    token, _ = _require_vk_settings()
+    data = dict(params or {})
+    data["access_token"] = token
+    data["v"] = VK_API_VERSION
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(f"{VK_API_URL}/{method}", data=data)
+        response.raise_for_status()
+        payload = response.json()
+
+    if "error" in payload:
+        err = payload["error"]
+        raise RuntimeError(f"VK API error {err.get('error_code')}: {err.get('error_msg')}")
+    return payload.get("response")
+
+
+# =====================================================================
+# Обработка входящих сообщений VK (текст, фото, голосовые, документы)
+# =====================================================================
+async def handle_vk_message(message_data: dict[str, Any]) -> None:
+    text = (message_data.get("text") or "").strip()
+    raw_attachments = message_data.get("attachments") or []
+
+    media_type: str | None = None
+    media_url: str | None = None
+    file_id: str | None = None
+    caption: str | None = None
+    file_name: str | None = None
+    file_size: int | None = None
+    duration_sec: int | None = None
+    parsed_attachments: list[dict[str, Any]] = []
+
+    for att in raw_attachments:
+        att_type = att.get("type")
+
+        # 1. Фотография (photo) - выбираем максимальное разрешение по width * height
+        if att_type == "photo" and "photo" in att:
+            photo_obj = att["photo"]
+            sizes = photo_obj.get("sizes", [])
+            best_size = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0), default={})
+            media_type = "photo"
+            media_url = best_size.get("url")
+            file_id = f"photo{photo_obj.get('owner_id')}_{photo_obj.get('id')}"
+            caption = photo_obj.get("text") or None
+            parsed_attachments.append({
+                "type": "photo",
+                "file_id": file_id,
+                "url": media_url,
+                "width": best_size.get("width"),
+                "height": best_size.get("height"),
+            })
+
+        # 2. Голосовое сообщение (audio_message)
+        elif att_type == "audio_message" and "audio_message" in att:
+            audio = att["audio_message"]
+            media_type = "voice"
+            media_url = audio.get("link_mp3") or audio.get("link_ogg")
+            duration_sec = audio.get("duration")
+            file_id = f"audio_message{audio.get('owner_id')}_{audio.get('id')}"
+            parsed_attachments.append({
+                "type": "voice",
+                "file_id": file_id,
+                "url": media_url,
+                "duration": duration_sec,
+            })
+
+        # 3. Документ (doc: PDF, сметы, чертежи)
+        elif att_type == "doc" and "doc" in att:
+            doc = att["doc"]
+            media_type = "document"
+            file_name = doc.get("title") or "Документ.pdf"
+            file_size = doc.get("size")
+            media_url = doc.get("url")
+            file_id = f"doc{doc.get('owner_id')}_{doc.get('id')}"
+            parsed_attachments.append({
+                "type": "document",
+                "file_id": file_id,
+                "file_name": file_name,
+                "size": file_size,
+                "url": media_url,
+            })
+
+    # Если текста нет, но есть подпись к фотографии
+    if not text and caption:
+        text = caption
+
+    # Безопасная проверка: пропускаем ТОЛЬКО если нет ни текста, ни медиафайла
+    if not text and not media_type:
+        return
+
+    from_id = message_data.get("from_id")
+    peer_id = message_data.get("peer_id") or from_id
+    message_id = message_data.get("id") or message_data.get("conversation_message_id")
+
+    contact_name = f"VK Клиент {from_id}"
+    try:
+        user_info = await _vk_method("users.get", {"user_ids": from_id})
+        if user_info and isinstance(user_info, list) and len(user_info) > 0:
+            first = user_info[0].get("first_name", "")
+            last = user_info[0].get("last_name", "")
+            contact_name = f"{first} {last}".strip() or contact_name
+    except Exception:
+        pass
+
+    payload = TestInboundRequest(
+        contact_name=contact_name,
+        text=text,
+        media_type=media_type,
+        media_url=media_url,
+        file_id=file_id,
+        caption=caption,
+        file_name=file_name,
+        file_size=file_size,
+        duration_sec=duration_sec,
+        attachments=parsed_attachments,
+        external_chat_id=f"vk-peer-{peer_id}",
+        external_contact_id=f"vk-user-{from_id}",
+        external_message_id=f"vk-msg-{message_id}",
+        channel=ChannelType.vk,
+    )
+
+    with Session(engine) as session:
+        create_inbound_message(session, payload)
+
+
+# =====================================================================
+# Отправка сообщений в диалог ВКонтакте
+# =====================================================================
+def send_vk_message(peer_id: int, message: str) -> dict[str, Any]:
+    import random
+    async def _send():
+        return await _vk_method(
+            "messages.send",
+            {"peer_id": peer_id, "message": message, "random_id": random.randint(1, 2**31 - 1)},
+        )
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_send())
+    raise RuntimeError("send_vk_message cannot be called from a running loop")
+
+
+# =====================================================================
+# Отметка сообщений как прочитанных (messages.markAsRead)
+# =====================================================================
+def mark_vk_message_read(peer_id: int, start_message_id: str | int | None = None) -> bool:
     async def _mark() -> bool:
-        params = {
-            "peer_id": abs(peer_id),
-            "mark_conversation_as_read": 1,
-        }
+        params = {"peer_id": abs(peer_id), "mark_conversation_as_read": 1}
         if start_message_id:
-            clean_id = str(start_message_id).replace("vk-message-", "")
+            clean_id = str(start_message_id).replace("vk-msg-", "").replace("vk-message-", "")
             if clean_id.isdigit():
                 params["start_message_id"] = int(clean_id)
-
         try:
             res = await _vk_method("messages.markAsRead", params)
             return bool(res == 1 or res is True or (isinstance(res, dict) and res.get("response") == 1))
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("VK messages.markAsRead failed: %s", exc)
+            logger.warning("VK messages.markAsRead failed: %s", exc)
             return False
 
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(_mark())
-
     return False
+
+
+# =====================================================================
+# Long Polling сообщества ВКонтакте (Bots Long Poll API)
+# =====================================================================
+async def vk_long_poll_loop() -> None:
+    if not getattr(settings, "vk_enabled", False) or not settings.vk_access_token or not settings.vk_group_id:
+        logger.info("VK connector is disabled")
+        return
+
+    logger.info("VK Long Polling loop started")
+    while True:
+        try:
+            server_info = await _vk_method("groups.getLongPollServer", {"group_id": settings.vk_group_id})
+            server = server_info["server"]
+            key = server_info["key"]
+            ts = server_info["ts"]
+
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                while True:
+                    resp = await client.get(f"{server}?act=a_check&key={key}&ts={ts}&wait=25")
+                    data = resp.json()
+                    if "failed" in data:
+                        break
+                    ts = data.get("ts", ts)
+                    for update in data.get("updates", []):
+                        if update.get("type") == "message_new":
+                            msg_obj = update.get("object", {}).get("message")
+                            if msg_obj:
+                                await handle_vk_message(msg_obj)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("VK Long Poll error, retry in 5s")
+            await asyncio.sleep(5)
 `,
     },
   };
@@ -1271,15 +1985,15 @@ async def max_long_poll_loop() -> None:
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-white select-none overflow-hidden">
+    <div className="flex-1 flex flex-col h-full bg-white dark:bg-zinc-950 select-none overflow-hidden text-zinc-800 dark:text-zinc-200">
       {/* 1. Header */}
-      <div className="px-6 py-4 border-b border-zinc-200 flex items-center justify-between bg-white shrink-0">
+      <div className="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between bg-white dark:bg-zinc-900 shrink-0">
         <div>
-          <h1 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-            <Code2 size={18} className="text-teal-700" />
+          <h1 className="text-base font-bold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+            <Code2 size={18} className="text-teal-700 dark:text-teal-400" />
             <span>Обновленный код бэкенда Python (FastAPI / SQLModel)</span>
           </h1>
-          <p className="text-xs text-zinc-600 mt-0.5">
+          <p className="text-xs text-zinc-600 dark:text-zinc-400 mt-0.5">
             Готовые файлы для развертывания: поддержка Проектов (ниш), Telegram Long Polling, коннектор Max и отметка «Прочитано».
           </p>
         </div>
@@ -1287,7 +2001,7 @@ async def max_long_poll_loop() -> None:
         <button
           type="button"
           onClick={handleCopy}
-          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium bg-teal-700 text-white hover:bg-teal-800 transition-colors shadow-2xs"
+          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium bg-teal-700 text-white hover:bg-teal-800 transition-colors shadow-2xs cursor-pointer"
         >
           {copied ? (
             <>
@@ -1304,7 +2018,7 @@ async def max_long_poll_loop() -> None:
       </div>
 
       {/* 2. File Tabs */}
-      <div className="px-6 border-b border-zinc-200 bg-zinc-50/70 flex items-center gap-2 overflow-x-auto shrink-0">
+      <div className="px-6 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-zinc-950/70 flex items-center gap-2 overflow-x-auto shrink-0">
         {(Object.keys(fileContents) as Array<keyof typeof fileContents>).map((key) => {
           const file = fileContents[key];
           const isActive = activeFile === key;
@@ -1313,13 +2027,13 @@ async def max_long_poll_loop() -> None:
               key={key}
               type="button"
               onClick={() => setActiveFile(key)}
-              className={`py-3 px-3 text-xs font-medium border-b-2 transition-all flex items-center gap-1.5 ${
+              className={`py-3 px-3 text-xs font-medium border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
                 isActive
-                  ? "border-teal-700 text-teal-800 bg-white/60 font-semibold"
-                  : "border-transparent text-zinc-600 hover:text-zinc-900 hover:border-zinc-300"
+                  ? "border-teal-700 text-teal-800 dark:text-teal-300 bg-white/60 dark:bg-zinc-900 font-semibold"
+                  : "border-transparent text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 hover:border-zinc-300 dark:hover:border-zinc-700"
               }`}
             >
-              <FileCode size={14} className={isActive ? "text-teal-700" : "text-zinc-600"} />
+              <FileCode size={14} className={isActive ? "text-teal-700 dark:text-teal-400" : "text-zinc-500"} />
               <span>{file.title}</span>
             </button>
           );
@@ -1327,17 +2041,17 @@ async def max_long_poll_loop() -> None:
       </div>
 
       {/* 3. Description banner */}
-      <div className="px-6 py-2.5 bg-teal-50/60 border-b border-teal-200/50 text-xs text-teal-950 flex items-center justify-between">
+      <div className="px-6 py-2.5 bg-teal-50/60 dark:bg-teal-950/40 border-b border-teal-200/50 dark:border-teal-900/50 text-xs text-teal-950 dark:text-teal-200 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="font-mono text-[11px] font-semibold text-teal-800 bg-white px-2 py-0.5 rounded border border-teal-200">
+          <span className="font-mono text-[11px] font-semibold text-teal-800 dark:text-teal-300 bg-white dark:bg-zinc-900 px-2 py-0.5 rounded border border-teal-200 dark:border-teal-800">
             {currentFile.path}
           </span>
-          <span className="text-teal-900 font-medium">{currentFile.desc}</span>
+          <span className="text-teal-900 dark:text-teal-200 font-medium">{currentFile.desc}</span>
         </div>
       </div>
 
       {/* 4. Code Display */}
-      <div className="flex-1 overflow-y-auto p-6 bg-zinc-900 font-mono text-xs text-zinc-100">
+      <div className="flex-1 overflow-y-auto p-6 bg-zinc-950 font-mono text-xs text-zinc-100">
         <pre className="whitespace-pre overflow-x-auto leading-relaxed selection:bg-teal-700 selection:text-white">
           <code>{currentFile.code}</code>
         </pre>

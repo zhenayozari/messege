@@ -6,18 +6,33 @@ export type ChannelType =
   | "max"
   | "avito"
   | "site"
-  | "instagram"
   | "test";
 
 export type MessageDirection = "inbound" | "outbound";
-export type SenderType = "client" | "operator" | "ai" | "system";
+export type SenderType = "client" | "operator" | "ai" | "system" | "note";
 export type LeadStatus = "new" | "qualifying" | "waiting_client" | "measurement_planned" | "won" | "lost";
 export type LeadTemperature = "cold" | "warm" | "hot";
 export type AiSuggestionMode = "draft" | "auto_allowed" | "human_required";
 export type AiSuggestionStatus = "pending" | "accepted" | "edited" | "rejected";
 export type ContentStatus = "idea" | "draft" | "review" | "approved" | "scheduled" | "published" | "archived";
 
-export type UserRole = "owner" | "manager";
+export type UserRole = "owner" | "manager" | "operator" | "measurer";
+
+export type TeamMemberStatus = "active" | "inactive" | "vacation";
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  role: UserRole;
+  status: TeamMemberStatus;
+  assigned_project_ids: string[]; // ['all'] or list of project IDs
+  avatar_color?: string;
+  notes?: string;
+  created_at?: string;
+  last_active_at?: string;
+}
 
 export interface User {
   id: string;
@@ -34,7 +49,8 @@ export type NavView =
   | "media"
   | "accounts"
   | "backend"
-  | "analytics";
+  | "analytics"
+  | "settings";
 
 export interface PostPerformance {
   id: string;
@@ -53,17 +69,28 @@ export interface PostPerformance {
   last_synced_at: string;
 }
 
+export type NicheType =
+  | "ceilings"
+  | "kitchens"
+  | "windows"
+  | "furniture"
+  | "repair"
+  | "general"
+  | (string & {});
+
 export interface Project {
   id: string;
   name: string;
   slug: string;
-  niche_type: "ceilings" | "kitchens" | "windows" | "general";
+  niche_type: NicheType;
   description: string;
   knowledge_dir: string;
   system_prompt: string;
   is_active: boolean;
   color: string;
   created_at: string;
+  channels?: ChannelType[];
+  starter_docs?: string[];
 }
 
 export interface Contact {
@@ -73,20 +100,36 @@ export interface Contact {
   primary_channel: ChannelType;
   city?: string | null;
   avatar_url?: string;
+  vk_url?: string;
+  external_id?: string;
+  first_seen_at?: string;
   notes?: string | null;
 }
+
+export type MediaType = "photo" | "voice" | "video_note" | "video" | "document" | "text";
 
 export interface Message {
   id: string;
   conversation_id: string;
   direction: MessageDirection;
   sender_type: SenderType;
-  text: string;
+  text?: string | null;
+  media_type?: MediaType | null;
+  media_url?: string | null;
+  blob_url?: string | null;
+  file_id?: string | null;
+  file_path?: string | null;
+  caption?: string | null;
+  file_name?: string | null;
+  file_size?: number | null;
+  duration_sec?: number | null;
   attachments?: Array<{ type: string; url: string; title?: string }>;
   delivery_status: string;
   is_read: boolean;
+  is_internal_note?: boolean;
   read_at?: string | null;
   created_at: string;
+  payload?: any;
 }
 
 export interface AiSuggestion {
@@ -96,6 +139,8 @@ export interface AiSuggestion {
   mode: AiSuggestionMode;
   status: AiSuggestionStatus;
   rag_sources?: string[];
+  provider?: "local_llama" | "openai";
+  model?: string;
   created_at: string;
 }
 
@@ -155,6 +200,8 @@ export interface Lead {
   desired_date?: string | null;
   phone_received: boolean;
   measurement_planned: boolean;
+  qualification_complete?: boolean;
+  created_at?: string;
   estimated_price?: number | null;
   custom_fields?: Record<string, any>;
   last_notification_at?: string | null;
@@ -201,6 +248,8 @@ export interface MediaAsset {
   url: string;
   description?: string | null;
   tags: string[];
+  file_size?: number | null;
+  file_name?: string | null;
   created_at: string;
 }
 
@@ -234,7 +283,9 @@ export interface CalendarEvent {
   channel: ChannelType;
   text: string;
   scheduled_at: string;
-  status: "scheduled" | "publishing" | "published" | "failed";
+  status: "scheduled" | "publishing" | "published" | "failed" | "draft";
+  post_url?: string;
+  published_at?: string;
 }
 
 export interface ChannelConnectorStatus {

@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from "react";
 import {
+  AiSuggestion,
   CalendarEvent,
   ChannelType,
   ContentItem,
   ContentVariant,
   Conversation,
+  Lead,
   LeadCalculation,
   MediaAsset,
   NavView,
@@ -21,24 +23,133 @@ import {
   INITIAL_POST_PERFORMANCES,
   INITIAL_PROJECTS,
 } from "./mockData";
+import { api } from "./services/api";
+import {
+  createProject as serviceCreateProject,
+  getActiveProject,
+  getStoredProjects,
+  setActiveProject as setServiceActiveProject,
+  subscribeProjects,
+} from "./services/projectsService";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { RightPanel } from "./components/RightPanel";
 import { ContentWorkspace } from "./components/ContentWorkspace";
 import { CalendarView } from "./components/CalendarView";
 import { MediaLibraryView } from "./components/MediaLibraryView";
-import { AccountsView } from "./components/AccountsView";
-import { BackendCodeView } from "./components/BackendCodeView";
 import { AnalyticsView } from "./components/AnalyticsView";
+import { SettingsView } from "./components/SettingsView";
+
+/**
+ * Умное слияние входящих диалогов из Telegram/Бэкенда с текущим локальным стейтом:
+ * ИЗОЛИРУЕТ состояние калькулятора (calculation) и лида (lead) оператора от перезаписи поллингом!
+ * Обновляет ТОЛЬКО новые сообщения (messages), счетчики и статус.
+ */
+function mergeConversationsPreservingState(
+  prevConvs: Conversation[],
+  incomingConvs: Conversation[],
+  activeConvId: string | null,
+): Conversation[] {
+  if (!incomingConvs || incomingConvs.length === 0) return prevConvs;
+
+  const prevMap = new Map(prevConvs.map((c) => [c.id, c]));
+  const processedIds = new Set<string>();
+  const merged: Conversation[] = [];
+
+  for (const inc of incomingConvs) {
+    processedIds.add(inc.id);
+    const prev = prevMap.get(inc.id);
+
+    if (prev) {
+      // Существующий диалог:
+      // Сравниваем сообщения по ID
+      const prevMsgIds = new Set(prev.messages.map((m) => m.id));
+      const newMsgs = inc.messages.filter((m) => !prevMsgIds.has(m.id));
+
+      const hasNewMessages = newMsgs.length > 0;
+      const isCurrentlyOpen = inc.id === activeConvId;
+
+      // Объединяем сообщения
+      const updatedMessages = hasNewMessages
+        ? [...prev.messages, ...newMsgs]
+        : prev.messages;
+
+      merged.push({
+        ...prev, // СОХРАНЯЕТ ВСЕ ПАРАМЕТРЫ ОПЕРАТОРА: calculation, lead, tags!
+        messages: updatedMessages,
+        unread_count: isCurrentlyOpen
+          ? 0
+          : hasNewMessages
+            ? (prev.unread_count || 0) + newMsgs.length
+            : prev.unread_count,
+        last_text: hasNewMessages ? inc.last_text || prev.last_text : prev.last_text,
+        last_message_at: hasNewMessages ? inc.last_message_at || prev.last_message_at : prev.last_message_at,
+        // AI Suggestion обновляем только если от клиента пришло реальное новое сообщение
+        pending_suggestion:
+          hasNewMessages && inc.pending_suggestion
+            ? inc.pending_suggestion
+            : prev.pending_suggestion,
+      });
+    } else {
+      // Новый диалог (например, написал новый клиент в Telegram)
+      merged.push(inc);
+    }
+  }
+
+  // Сохраняем диалоги, которые есть в локальном стейте, но не вернулись в ответе
+  for (const prev of prevConvs) {
+    if (!processedIds.has(prev.id)) {
+      merged.push(prev);
+    }
+  }
+
+  return merged;
+}
 
 export default function App() {
   // Navigation & Project state
   const [currentView, setCurrentView] = useState<NavView>("dialogs");
-  const [userRole, setUserRole] = useState<UserRole>("owner");
-  const [projects, setProjects] = useState<Project[]>(INITIAL_PROJECTS);
-  const [activeProject, setActiveProject] = useState<Project>(INITIAL_PROJECTS[0]);
+  const [userRole, setUserRole] = useState<UserRole>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("phoenix_user_role") as UserRole;
+      if (saved && ["owner", "manager", "operator", "measurer"].includes(saved)) {
+        return saved;
+      }
+    }
+    return "owner";
+  });
+  const [projects, setProjects] = useState<Project[]>(() => getStoredProjects());
+  const [activeProject, setActiveProject] = useState<Project>(() => getActiveProject());
 
-  // Data states
+  const handleRoleChange = (role: UserRole) => {
+    setUserRole(role);
+    try {
+      localStorage.setItem("phoenix_user_role", role);
+    } catch {}
+
+    // Check if the current view is accessible under the new role
+    if (role === "operator" && currentView !== "dialogs") {
+      setCurrentView("dialogs");
+    } else if (role === "measurer" && currentView !== "dialogs" && currentView !== "calendar") {
+      setCurrentView("dialogs");
+    } else if (
+      role === "manager" &&
+      (currentView === "settings" || currentView === "accounts" || currentView === "backend")
+    ) {
+      setCurrentView("dialogs");
+    }
+  };
+
+  // Subscribe to real-time project switching and creation
+  useEffect(() => {
+    const unsub = subscribeProjects((updatedProjects, currentActive) => {
+      setProjects(updatedProjects);
+      setActiveProject(currentActive);
+    });
+    return unsub;
+  }, []);
+
+  // Data states with seed fallback
   const [conversations, setConversations] = useState<Conversation[]>(INITIAL_CONVERSATIONS);
   const [selectedConvId, setSelectedConvId] = useState<string | null>(
     INITIAL_CONVERSATIONS.find((c) => c.project_id === INITIAL_PROJECTS[0].id)?.id ||
@@ -49,6 +160,7 @@ export default function App() {
   const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>(INITIAL_MEDIA_ASSETS);
   const [connectors, setConnectors] = useState(INITIAL_CONNECTORS);
   const [performances, setPerformances] = useState<PostPerformance[]>(INITIAL_POST_PERFORMANCES);
+  const [isDataLoaded, setIsDataLoaded] = useState(false);
 
   // Dark Mode State
   const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
@@ -67,6 +179,69 @@ export default function App() {
 
   const toggleDarkMode = () => setIsDarkMode((prev) => !prev);
 
+  // 1. Первоначальная загрузка проектов, календаря и медиа из базы через API
+  useEffect(() => {
+    let isMounted = true;
+    async function initData() {
+      try {
+        const [loadedProjects, loadedEvents, loadedMedia] = await Promise.all([
+          api.getProjects(),
+          api.getScheduledPosts(),
+          api.getMediaAssets(),
+        ]);
+        if (!isMounted) return;
+        if (loadedProjects && loadedProjects.length > 0) {
+          setProjects(loadedProjects);
+          setActiveProject((prev) => loadedProjects.find((p) => p.id === prev.id) || loadedProjects[0]);
+        }
+        if (loadedEvents && loadedEvents.length > 0) {
+          setCalendarEvents(loadedEvents);
+        }
+        if (loadedMedia && loadedMedia.length > 0) {
+          setMediaAssets(loadedMedia);
+        }
+      } catch (err) {
+        console.warn("API initial load fallback to seeds:", err);
+      } finally {
+        if (isMounted) setIsDataLoaded(true);
+      }
+    }
+    initData();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // 2. Загрузка диалогов и контента при старте и переключении активного Project (ниши)
+  useEffect(() => {
+    let isMounted = true;
+    async function loadProjectData() {
+      try {
+        const [loadedConvs, loadedItems] = await Promise.all([
+          api.getConversations(activeProject.id),
+          api.getContentItems(activeProject.id),
+        ]);
+        if (!isMounted) return;
+        if (loadedConvs && loadedConvs.length > 0) {
+          setConversations(loadedConvs);
+          setSelectedConvId((prevId) => {
+            if (prevId && loadedConvs.some((c) => c.id === prevId)) return prevId;
+            return loadedConvs[0]?.id || null;
+          });
+        }
+        if (loadedItems && loadedItems.length > 0) {
+          setContentItems(loadedItems);
+        }
+      } catch (err) {
+        console.warn("API project load fallback:", err);
+      }
+    }
+    loadProjectData();
+    return () => {
+      isMounted = false;
+    };
+  }, [activeProject.id]);
+
   // Inter-view navigation state (e.g. Calendar event -> Content workspace)
   const [targetContentItemId, setTargetContentItemId] = useState<string | null>(null);
   const [targetContentChannel, setTargetContentChannel] = useState<ChannelType | null>(null);
@@ -84,10 +259,38 @@ export default function App() {
     );
   };
 
+  // Calendar delete / cancel scheduled event
+  const handleDeleteCalendarEvent = (eventId: string) => {
+    setCalendarEvents((prev) => prev.filter((ev) => ev.id !== eventId));
+  };
+
+  // Calendar add event
+  const handleAddCalendarEvent = async (newEvent: CalendarEvent) => {
+    await api.schedulePost(newEvent);
+    setCalendarEvents((prev) => [...prev, newEvent]);
+  };
+
   // Calendar Publish handler
-  const handlePublishCalendarEvent = (event: CalendarEvent) => {
+  const handlePublishCalendarEvent = async (event: CalendarEvent) => {
+    let publishResult: any = null;
+    try {
+      publishResult = await api.publishPostNow(event.id);
+    } catch (err: any) {
+      console.error("Failed to publish calendar event:", err);
+      throw err;
+    }
+
     setCalendarEvents((prev) =>
-      prev.map((e) => (e.id === event.id ? { ...e, status: "published" } : e)),
+      prev.map((e) =>
+        e.id === event.id
+          ? {
+              ...e,
+              status: "published",
+              post_url: publishResult?.url || e.post_url,
+              published_at: new Date().toISOString(),
+            }
+          : e,
+      ),
     );
     setPerformances((prev) => {
       const existing = prev.find(
@@ -110,13 +313,13 @@ export default function App() {
         content_item_id: event.content_item_id,
         content_title: event.content_title,
         channel: event.channel,
-        views_count: Math.floor(Math.random() * 40) + 15,
-        likes_count: Math.floor(Math.random() * 6) + 1,
+        views_count: 0,
+        likes_count: 0,
         comments_count: 0,
         shares_count: 0,
-        leads_count: 1,
+        leads_count: 0,
         measurements_count: 0,
-        conversion_rate: 5.5,
+        conversion_rate: 0,
         published_at: new Date().toISOString(),
         last_synced_at: new Date().toISOString(),
       };
@@ -124,33 +327,105 @@ export default function App() {
     });
   };
 
-  // 10-second Polling mechanism for real-time synchronization
+  // 3. Фоновый опрос (polling) каждые 5 секунд для получения входящих сообщений в реальном времени (Telegram + VK)
   const [isPolling, setIsPolling] = useState(false);
 
+  // Подписка на обновление локальных диалогов (например, при ручной синхронизации в настройках)
   useEffect(() => {
-    const timer = setInterval(() => {
-      setIsPolling(true);
-      setTimeout(() => {
-        setIsPolling(false);
-      }, 600);
-    }, 10000);
-
-    return () => clearInterval(timer);
-  }, []);
-
-  const handleManualPoll = () => {
-    setIsPolling(true);
-    setTimeout(() => {
-      setIsPolling(false);
-    }, 600);
-  };
-
-  const handleRoleChange = (newRole: UserRole) => {
-    setUserRole(newRole);
-    if (newRole === "manager") {
-      if (currentView === "accounts" || currentView === "backend" || currentView === "analytics") {
-        setCurrentView("dialogs");
+    const handleConvsUpdated = (e: any) => {
+      if (e.detail && Array.isArray(e.detail)) {
+        setConversations((prev) =>
+          mergeConversationsPreservingState(prev, e.detail, selectedConvId),
+        );
       }
+    };
+    window.addEventListener("phoenix_conversations_updated", handleConvsUpdated);
+    return () => {
+      window.removeEventListener("phoenix_conversations_updated", handleConvsUpdated);
+    };
+  }, [selectedConvId]);
+
+  useEffect(() => {
+    const pollUpdates = async () => {
+      setIsPolling(true);
+      try {
+        // 1. Прямой опрос Telegram Bot API (Fallback для режима Live Preview)
+        const tgRes = await api.syncTelegram(activeProject.id);
+        if (tgRes.conversations && tgRes.conversations.length > 0) {
+          setConversations((prev) =>
+            mergeConversationsPreservingState(prev, tgRes.conversations, selectedConvId),
+          );
+        }
+
+        // 2. Прямой опрос сообщества ВКонтакте при наличии токена
+        if (api.getVkToken()) {
+          const vkRes = await api.syncVk(activeProject.id);
+          if (vkRes.conversations && vkRes.conversations.length > 0) {
+            setConversations((prev) =>
+              mergeConversationsPreservingState(prev, vkRes.conversations, selectedConvId),
+            );
+          }
+        }
+
+        // 3. Опрос серверного API, если оба канала не вернули данных
+        if (!tgRes.conversations || tgRes.conversations.length === 0) {
+          const serverConvs = await api.getConversations(activeProject.id);
+          if (serverConvs && serverConvs.length > 0) {
+            setConversations((prev) =>
+              mergeConversationsPreservingState(prev, serverConvs, selectedConvId),
+            );
+          }
+        }
+      } catch (err) {
+        console.warn("Polling error:", err);
+      } finally {
+        setTimeout(() => setIsPolling(false), 500);
+      }
+    };
+
+    // Запускаем сразу при старте/смене проекта
+    pollUpdates();
+
+    const timer = setInterval(pollUpdates, 5000);
+    return () => clearInterval(timer);
+  }, [activeProject.id, selectedConvId]);
+
+  const handleManualPoll = async () => {
+    setIsPolling(true);
+    try {
+      // Опрашиваем Telegram
+      const tgRes = await api.syncTelegram(activeProject.id);
+      if (tgRes.conversations && tgRes.conversations.length > 0) {
+        setConversations((prev) =>
+          mergeConversationsPreservingState(prev, tgRes.conversations, selectedConvId),
+        );
+        if (tgRes.newMessagesCount > 0) {
+          const firstTgConv = tgRes.conversations.find((c) => c.channel === "telegram");
+          if (firstTgConv) {
+            setSelectedConvId(firstTgConv.id);
+          }
+        }
+      }
+
+      // Опрашиваем ВКонтакте (если настроен токен)
+      if (api.getVkToken()) {
+        const vkRes = await api.syncVk(activeProject.id);
+        if (vkRes.conversations && vkRes.conversations.length > 0) {
+          setConversations((prev) =>
+            mergeConversationsPreservingState(prev, vkRes.conversations, selectedConvId),
+          );
+          if (vkRes.newMessagesCount > 0) {
+            const firstVkConv = vkRes.conversations.find((c) => c.channel === "vk");
+            if (firstVkConv) {
+              setSelectedConvId(firstVkConv.id);
+            }
+          }
+        }
+      }
+    } catch {
+      //
+    } finally {
+      setTimeout(() => setIsPolling(false), 500);
     }
   };
 
@@ -203,9 +478,10 @@ export default function App() {
     .filter((c) => c.project_id === activeProject.id)
     .reduce((sum, c) => sum + c.unread_count, 0);
 
-  // When project changes, pick first available conversation
+  // When project changes, pick first available conversation and persist to localStorage
   const handleSelectProject = (proj: Project) => {
-    setActiveProject(proj);
+    const updated = setServiceActiveProject(proj.id);
+    setActiveProject(updated);
     const firstInProj = conversations.find((c) => c.project_id === proj.id);
     if (firstInProj) {
       setSelectedConvId(firstInProj.id);
@@ -215,31 +491,27 @@ export default function App() {
   };
 
   // Create new project / niche
-  const handleCreateProject = (
+  const handleCreateProject = async (
     name: string,
     nicheType: Project["niche_type"],
     desc: string,
   ) => {
-    const newProj: Project = {
-      id: `proj-${Date.now()}`,
+    const newProj = serviceCreateProject({
       name,
-      slug: name.toLowerCase().replace(/\s+/g, "-"),
       niche_type: nicheType,
       description: desc,
-      knowledge_dir: `/app/knowledge/${name.toLowerCase().replace(/\s+/g, "_")}`,
-      system_prompt: `Ты AI-помощник компании ${name}. Консультируй клиентов, отвечай дружелюбно и веди к заявке / замеру.`,
-      is_active: true,
-      color: "#4f46e5",
-      created_at: new Date().toISOString(),
-    };
+      system_prompt: `Ты — AI-помощник компании ${name}. Консультируй клиентов, отвечай дружелюбно, экспертно и веди к заявке / замеру.`,
+      setAsActive: true,
+    });
 
-    setProjects([...projects, newProj]);
+    setProjects(getStoredProjects());
     setActiveProject(newProj);
     setSelectedConvId(null);
   };
 
   // Mark conversation as read (local + connector sync)
   const handleMarkRead = (convId: string) => {
+    api.markConversationRead(convId).catch(() => {});
     setConversations((prev) =>
       prev.map((conv) => {
         if (conv.id !== convId) return conv;
@@ -247,8 +519,8 @@ export default function App() {
           ...conv,
           unread_count: 0,
           messages: conv.messages.map((m) =>
-            m.direction === "inbound" && !m.is_read
-              ? { ...m, is_read: true, read_at: new Date().toISOString() }
+            !m.is_read
+              ? { ...m, is_read: true, read_at: m.read_at || new Date().toISOString() }
               : m,
           ),
         };
@@ -262,63 +534,81 @@ export default function App() {
     handleMarkRead(id);
   };
 
-  // Send message
-  const handleSendMessage = (text: string) => {
+  // Send message or save internal team note
+  const handleSendMessage = async (
+    text: string,
+    isInternalNote: boolean = false,
+    attachmentFile?: File,
+  ) => {
     if (!selectedConvId) return;
-    const now = new Date().toISOString();
-    const newMsg = {
-      id: `msg-${Date.now()}`,
-      conversation_id: selectedConvId,
-      direction: "outbound" as const,
-      sender_type: "operator" as const,
-      text,
-      delivery_status: "delivered",
-      is_read: true,
-      read_at: now,
-      created_at: now,
-    };
+    try {
+      const newMsg = await api.sendMessage(
+        selectedConvId,
+        text,
+        "outbound",
+        isInternalNote,
+        undefined,
+        attachmentFile,
+      );
 
-    setConversations((prev) =>
-      prev.map((c) => {
-        if (c.id !== selectedConvId) return c;
-        return {
-          ...c,
-          last_text: text,
-          last_message_at: now,
-          messages: [...c.messages, newMsg],
-          pending_suggestion: null,
-        };
-      }),
-    );
+      const now = new Date().toISOString();
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.id !== selectedConvId) return c;
+          const hasMsg = c.messages.some((m) => m.id === newMsg.id);
+          return {
+            ...c,
+            last_text: isInternalNote
+              ? `🔒 Заметка: ${text}`
+              : (text || (newMsg.media_type === "photo" ? "📷 Фотография" : "📄 Документ")),
+            last_message_at: now,
+            messages: hasMsg ? c.messages : [...c.messages, newMsg],
+            pending_suggestion: isInternalNote ? c.pending_suggestion : null,
+          };
+        }),
+      );
+      return newMsg;
+    } catch (err) {
+      console.error("Failed to send message:", err);
+      throw err;
+    }
   };
 
   // Suggestion actions
   const handleAcceptSuggestion = (text: string) => {
-    handleSendMessage(text);
+    handleSendMessage(text, false);
   };
 
-  const handleRewriteSuggestion = (
+  const handleRewriteSuggestion = async (
     convId: string,
     sugId: string,
     feedback: string,
   ) => {
-    setConversations((prev) =>
-      prev.map((c) => {
-        if (c.id !== convId || !c.pending_suggestion) return c;
-        const rewritten = `${c.pending_suggestion.suggested_text} (переписано с учетом: «${feedback || "короче"}»)`;
-        return {
-          ...c,
-          pending_suggestion: {
-            ...c.pending_suggestion,
-            suggested_text: rewritten,
-            confidence: 0.94,
-          },
-        };
-      }),
-    );
+    try {
+      const rewritten = await api.rewriteAiSuggestion(convId, feedback);
+      setConversations((prev) =>
+        prev.map((c) => (c.id === convId ? { ...c, pending_suggestion: rewritten } : c)),
+      );
+    } catch {
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.id !== convId || !c.pending_suggestion) return c;
+          const rewrittenText = `${c.pending_suggestion.suggested_text} (переписано с учетом: «${feedback || "короче"}»)`;
+          return {
+            ...c,
+            pending_suggestion: {
+              ...c.pending_suggestion,
+              suggested_text: rewrittenText,
+              confidence: 0.94,
+            },
+          };
+        }),
+      );
+    }
   };
 
   const handleRejectSuggestion = (convId: string, sugId: string) => {
+    api.rejectAiSuggestion(convId, sugId).catch(() => {});
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== convId || !c.pending_suggestion) return c;
@@ -333,16 +623,43 @@ export default function App() {
     );
   };
 
+  const handleUpdateSuggestion = (convId: string, suggestion: AiSuggestion) => {
+    setConversations((prev) =>
+      prev.map((c) => {
+        if (c.id !== convId) return c;
+        return {
+          ...c,
+          pending_suggestion: suggestion,
+        };
+      }),
+    );
+  };
+
   // Lead update
   const handleUpdateLead = (updates: Partial<Conversation["lead"]>) => {
     if (!selectedConvId) return;
+    const currentConv = conversations.find((c) => c.id === selectedConvId);
+    const leadId = currentConv?.lead?.id || `lead-${selectedConvId}`;
+    api.updateLead(leadId, updates as Partial<Lead>, selectedConvId).catch(() => {});
+
     setConversations((prev) =>
       prev.map((c) => {
-        if (c.id !== selectedConvId || !c.lead) return c;
+        if (c.id !== selectedConvId) return c;
         return {
           ...c,
           lead: {
-            ...c.lead,
+            ...(c.lead || {
+              id: leadId,
+              project_id: c.project_id,
+              contact_id: c.contact_id,
+              conversation_id: c.id,
+              status: "new",
+              temperature: "warm",
+              source: c.channel,
+              phone_received: false,
+              measurement_planned: false,
+              updated_at: new Date().toISOString(),
+            }),
             ...updates,
             updated_at: new Date().toISOString(),
           },
@@ -354,11 +671,15 @@ export default function App() {
   // Calculation update
   const handleUpdateCalculation = (calcUpdates: Partial<LeadCalculation>) => {
     if (!selectedConvId) return;
+    const currentConv = conversations.find((c) => c.id === selectedConvId);
+    const calcId = currentConv?.calculation?.id || `calc-${selectedConvId}`;
+    api.updateCalculation(calcId, calcUpdates, selectedConvId).catch(() => {});
+
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== selectedConvId) return c;
         const currentCalc = c.calculation || {
-          id: `calc-${Date.now()}`,
+          id: calcId,
           lead_id: c.lead?.id || "",
           conversation_id: c.id,
         };
@@ -374,23 +695,13 @@ export default function App() {
   };
 
   // Content actions
-  const handleCreateContentItem = (itemData: Partial<ContentItem>) => {
-    const newItem: ContentItem = {
-      id: `cnt-${Date.now()}`,
+  const handleCreateContentItem = async (itemData: Partial<ContentItem>) => {
+    const newItem = await api.createContentItem({
+      ...itemData,
       project_id: itemData.project_id || activeProject.id,
-      title: itemData.title || "Новый материал",
-      topic: itemData.topic || "",
-      rubric: itemData.rubric || "Общее",
-      goal: itemData.goal || "lead_generation",
-      offer: itemData.offer || "",
-      trigger_keyword: itemData.trigger_keyword || "ЗАМЕР",
-      status: itemData.status || "idea",
-      variants: itemData.variants || [],
-      media_assets: itemData.media_assets || [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    setContentItems([newItem, ...contentItems]);
+    });
+    setContentItems((prev) => [newItem, ...prev.filter((i) => i.id !== newItem.id)]);
+    return newItem;
   };
 
   const handleUpdateVariantText = (
@@ -399,6 +710,8 @@ export default function App() {
     text: string,
     channel?: ChannelType,
   ) => {
+    api.updateContentVariant(variantId, text, itemId, channel).catch(() => {});
+    const nowIso = new Date().toISOString();
     setContentItems((prev) =>
       prev.map((item) => {
         if (item.id !== itemId) return item;
@@ -406,8 +719,11 @@ export default function App() {
         if (exists) {
           return {
             ...item,
+            updated_at: nowIso,
             variants: item.variants.map((v) =>
-              v.id === variantId || (channel && v.channel === channel) ? { ...v, text } : v,
+              v.id === variantId || (channel && v.channel === channel)
+                ? { ...v, text, updated_at: nowIso }
+                : v,
             ),
           };
         } else if (channel) {
@@ -422,32 +738,48 @@ export default function App() {
           };
           return {
             ...item,
+            updated_at: nowIso,
             variants: [...item.variants, newVariant],
           };
         }
         return item;
       }),
     );
+
+    // Sync updated text with any matching calendar event
+    setCalendarEvents((prev) =>
+      prev.map((ev) => {
+        if (
+          ev.content_item_id === itemId &&
+          (ev.content_variant_id === variantId || (channel && ev.channel === channel))
+        ) {
+          return { ...ev, text };
+        }
+        return ev;
+      }),
+    );
   };
 
-  const handleScheduleVariant = (
+  const handleScheduleVariant = async (
     itemId: string,
     variantId: string,
     channel: ChannelType,
     text: string,
+    scheduledAt?: string,
   ) => {
     const item = contentItems.find((i) => i.id === itemId);
     const newEvent: CalendarEvent = {
-      id: `ev-${Date.now()}`,
+      id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       content_item_id: itemId,
       content_variant_id: variantId,
       content_title: item?.title || "Публикация",
       channel,
       text,
-      scheduled_at: "2026-09-15T12:00:00Z",
+      scheduled_at: scheduledAt || new Date(Date.now() + 86400000).toISOString(),
       status: "scheduled",
     };
-    setCalendarEvents([...calendarEvents, newEvent]);
+    await api.schedulePost(newEvent);
+    setCalendarEvents((prev) => [...prev, newEvent]);
 
     // Автоматическое создание записи отслеживания в PostPerformance
     const newPerf: PostPerformance = {
@@ -463,24 +795,18 @@ export default function App() {
       leads_count: 0,
       measurements_count: 0,
       conversion_rate: 0,
-      published_at: new Date().toISOString(),
+      published_at: scheduledAt || new Date().toISOString(),
       last_synced_at: new Date().toISOString(),
     };
     setPerformances((prev) => [newPerf, ...prev]);
   };
 
-  const handleUploadMedia = (asset: Partial<MediaAsset>) => {
-    const newMedia: MediaAsset = {
-      id: `med-${Date.now()}`,
+  const handleUploadMedia = async (asset: Partial<MediaAsset>) => {
+    const newMedia = await api.uploadMediaAsset({
+      ...asset,
       project_id: asset.project_id || activeProject.id,
-      title: asset.title || "Медиа",
-      asset_type: asset.asset_type || "photo",
-      url: asset.url || "https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800",
-      description: asset.description || "",
-      tags: asset.tags || [],
-      created_at: new Date().toISOString(),
-    };
-    setMediaAssets([newMedia, ...mediaAssets]);
+    });
+    setMediaAssets((prev) => [newMedia, ...prev.filter((m) => m.id !== newMedia.id)]);
   };
 
   const handleUpdateItemMedia = (itemId: string, media: MediaAsset[]) => {
@@ -491,10 +817,22 @@ export default function App() {
     );
   };
 
+  const handleUpdateContentItem = async (updatedItem: ContentItem) => {
+    setContentItems((prev) =>
+      prev.map((item) => (item.id === updatedItem.id ? updatedItem : item))
+    );
+    try {
+      await api.updateContentItem(updatedItem.id, updatedItem);
+    } catch {
+      // ignore
+    }
+  };
+
   const handleMergeContacts = (
     mainContactId: string,
     duplicateContactId: string,
   ) => {
+    api.mergeContacts(mainContactId, duplicateContactId).catch(() => {});
     setConversations((prev) => {
       const mainConv = prev.find((c) => c.contact_id === mainContactId);
       const dupConv = prev.find((c) => c.contact_id === duplicateContactId);
@@ -536,12 +874,26 @@ export default function App() {
 
   const handleSyncPerformance = () => {
     setPerformances((prev) =>
-      prev.map((p) => ({
-        ...p,
-        views_count: p.views_count + Math.floor(Math.random() * 45) + 10,
-        likes_count: p.likes_count + Math.floor(Math.random() * 5) + 1,
-        last_synced_at: new Date().toISOString(),
-      })),
+      prev.map((p) => {
+        // Честный пересчет лидов из базы диалогов для данного канала
+        const matchingLeads = conversations.filter(
+          (c) => c.project_id === p.project_id && (c.channel === p.channel || (p.channel === "vk_wall" && c.channel === "vk"))
+        );
+        const measurementsCount = matchingLeads.filter(
+          (c) => c.lead?.measurement_planned || c.lead?.status === "measurement_planned"
+        ).length;
+        const convRate = matchingLeads.length > 0
+          ? Number(((measurementsCount / matchingLeads.length) * 100).toFixed(1))
+          : p.conversion_rate;
+
+        return {
+          ...p,
+          leads_count: Math.max(p.leads_count, matchingLeads.length),
+          measurements_count: Math.max(p.measurements_count, measurementsCount),
+          conversion_rate: convRate,
+          last_synced_at: new Date().toISOString(),
+        };
+      }),
     );
   };
 
@@ -603,11 +955,13 @@ export default function App() {
             {/* Center Chat Timeline */}
             <ChatPanel
               conversation={selectedConversation}
+              activeProject={activeProject}
               onSendMessage={handleSendMessage}
               onMarkRead={handleMarkRead}
               onAcceptSuggestion={handleAcceptSuggestion}
               onRewriteSuggestion={handleRewriteSuggestion}
               onRejectSuggestion={handleRejectSuggestion}
+              onUpdateSuggestion={handleUpdateSuggestion}
             />
 
             {/* Right Resizer Handle */}
@@ -645,6 +999,7 @@ export default function App() {
             onScheduleVariant={handleScheduleVariant}
             onUpdateItemMedia={handleUpdateItemMedia}
             onUploadMedia={handleUploadMedia}
+            onUpdateContentItem={handleUpdateContentItem}
           />
         )}
 
@@ -652,7 +1007,10 @@ export default function App() {
           <CalendarView
             activeProject={activeProject}
             events={calendarEvents}
+            contentItems={contentItems}
             onUpdateEventDate={handleUpdateEventDate}
+            onDeleteEvent={handleDeleteCalendarEvent}
+            onAddEvent={handleAddCalendarEvent}
             onNavigateToContent={handleNavigateToContent}
             onPublishNow={handlePublishCalendarEvent}
           />
@@ -678,10 +1036,48 @@ export default function App() {
         )}
 
         {currentView === "accounts" && (
-          <AccountsView connectors={connectors} />
+          <SettingsView
+            activeProject={activeProject}
+            userRole={userRole}
+            onNavigateToDialogs={() => setCurrentView("dialogs")}
+            connectors={connectors}
+            onSyncTelegram={handleManualPoll}
+            onSyncVk={handleManualPoll}
+            initialTab="integrations"
+            onSelectProject={handleSelectProject}
+            onRoleChange={handleRoleChange}
+            projects={projects}
+          />
         )}
 
-        {currentView === "backend" && <BackendCodeView />}
+        {currentView === "backend" && (
+          <SettingsView
+            activeProject={activeProject}
+            userRole={userRole}
+            onNavigateToDialogs={() => setCurrentView("dialogs")}
+            connectors={connectors}
+            onSyncTelegram={handleManualPoll}
+            onSyncVk={handleManualPoll}
+            initialTab="backend"
+            onSelectProject={handleSelectProject}
+            onRoleChange={handleRoleChange}
+            projects={projects}
+          />
+        )}
+
+        {currentView === "settings" && (
+          <SettingsView
+            activeProject={activeProject}
+            userRole={userRole}
+            onNavigateToDialogs={() => setCurrentView("dialogs")}
+            connectors={connectors}
+            onSyncTelegram={handleManualPoll}
+            onSyncVk={handleManualPoll}
+            onSelectProject={handleSelectProject}
+            onRoleChange={handleRoleChange}
+            projects={projects}
+          />
+        )}
       </div>
     </div>
   );

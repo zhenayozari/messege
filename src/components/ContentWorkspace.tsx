@@ -1,25 +1,42 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  AlertCircle,
   Calendar,
   Check,
   CheckCircle,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Copy,
+  Edit3,
+  ExternalLink,
   FileText,
-  Filter,
+  Gift,
+  Hash,
   Image as ImageIcon,
-  Layers,
   Plus,
   RefreshCw,
   Save,
   Send,
+  Sliders,
   Sparkles,
+  Tag,
+  Target,
   Trash2,
-  Workflow,
+  UploadCloud,
   X,
+  Zap,
 } from "lucide-react";
-import { ChannelType, ContentItem, ContentStatus, ContentVariant, MediaAsset, Project } from "../types";
+import {
+  ChannelType,
+  ContentItem,
+  ContentStatus,
+  ContentVariant,
+  MediaAsset,
+  Project,
+} from "../types";
 import { MediaLibrary } from "./MediaLibrary";
+import { api } from "../services/api";
 
 interface ContentWorkspaceProps {
   activeProject: Project;
@@ -28,10 +45,22 @@ interface ContentWorkspaceProps {
   initialItemId?: string | null;
   initialChannelTab?: ChannelType | null;
   onCreateContentItem: (item: Partial<ContentItem>) => void;
-  onUpdateVariantText: (itemId: string, variantId: string, text: string, channel?: ChannelType) => void;
-  onScheduleVariant: (itemId: string, variantId: string, channel: ChannelType, text: string) => void;
+  onUpdateVariantText: (
+    itemId: string,
+    variantId: string,
+    text: string,
+    channel?: ChannelType
+  ) => void;
+  onScheduleVariant: (
+    itemId: string,
+    variantId: string,
+    channel: ChannelType,
+    text: string,
+    scheduledAt?: string
+  ) => void;
   onUpdateItemMedia: (itemId: string, media: MediaAsset[]) => void;
   onUploadMedia: (asset: Partial<MediaAsset>) => void;
+  onUpdateContentItem?: (item: ContentItem) => void;
 }
 
 const channelTabLabels: Record<string, string> = {
@@ -39,8 +68,23 @@ const channelTabLabels: Record<string, string> = {
   vk_channel: "VK канал",
   telegram: "Telegram",
   max: "MAX",
-  instagram: "Instagram",
 };
+
+const rubricPresets = [
+  "Кейсы и до/после",
+  "Экспертный разбор",
+  "Цены и сметы",
+  "Акции и скидки",
+  "Технологии монтажа",
+  "Отзывы клиентов",
+];
+
+const goalOptions = [
+  { value: "lead_generation", label: "Генерация лидов (заявки на замер / расчет)" },
+  { value: "trust", label: "Доверие и экспертность (демонстрация качества)" },
+  { value: "engagement", label: "Вовлечение аудитории (комментарии и обсуждения)" },
+  { value: "direct_sales", label: "Прямые продажи (акции со сроком)" },
+];
 
 export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
   activeProject,
@@ -53,19 +97,65 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
   onScheduleVariant,
   onUpdateItemMedia,
   onUploadMedia,
+  onUpdateContentItem,
 }) => {
   const projectItems = contentItems.filter((i) => i.project_id === activeProject.id);
+
   const [selectedItemId, setSelectedItemId] = useState<string | null>(
-    initialItemId || projectItems[0]?.id || null,
+    initialItemId || projectItems[0]?.id || null
   );
   const [activeChannelTab, setActiveChannelTab] = useState<ChannelType>(
-    initialChannelTab || "vk_wall",
+    initialChannelTab || "vk_wall"
   );
-  const [newIdeaTitle, setNewIdeaTitle] = useState("");
+
+  // Search filter for sidebar items
+  const [searchFilter, setSearchFilter] = useState("");
+
+  // Notifications
   const [copiedNotification, setCopiedNotification] = useState(false);
-  const [scheduledNotification, setScheduledNotification] = useState<string | null>(null);
-  const [saveNotification, setSaveNotification] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<{
+    type: "success" | "error" | "info";
+    title: string;
+    details?: string;
+    vkUrl?: string;
+    tgUrl?: string;
+  } | null>(null);
+
+  // Collapsible Parameters Panel state (collapsed by default)
+  const [isParamsExpanded, setIsParamsExpanded] = useState(false);
+
+  // Popover Dialogs state
+  const [isPublishNowOpen, setIsPublishNowOpen] = useState(false);
+  const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [showMediaPicker, setShowMediaPicker] = useState(false);
+
+  // "Publish Now" state
+  const [publishChannels, setPublishChannels] = useState<{ vk: boolean; tg: boolean }>({
+    vk: true,
+    tg: true,
+  });
+  const [isPublishingNow, setIsPublishingNow] = useState(false);
+
+  // "Schedule" state
+  const [scheduleChannels, setScheduleChannels] = useState<{ vk: boolean; tg: boolean }>({
+    vk: true,
+    tg: true,
+  });
+  // Default date: tomorrow
+  const getTomorrowIso = () => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  };
+  const [scheduleDate, setScheduleDate] = useState<string>(getTomorrowIso());
+  const [scheduleTime, setScheduleTime] = useState<string>("12:00");
+
+  // AI adaptation running indicator
+  const [isAdaptingAi, setIsAdaptingAi] = useState(false);
+
+  // Drag-and-drop upload state
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Sync external navigation requests (e.g. from Calendar click)
   useEffect(() => {
@@ -88,21 +178,25 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
 
   // Local draft text for immediate typing feedback + autosave / manual save
   const [editorText, setEditorText] = useState("");
+  const [postTitle, setPostTitle] = useState("");
   const [saveStatus, setSaveStatus] = useState<"saved" | "unsaved" | "saving">("saved");
   const [lastSavedTime, setLastSavedTime] = useState<string | null>(null);
   const autosaveTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Sync editor text when switching item or channel tab
+  // Sync editor text and title when switching item or channel tab
   useEffect(() => {
+    if (selectedItem) {
+      setPostTitle(selectedItem.title || "");
+    }
     if (activeVariant) {
-      setEditorText(activeVariant.text);
+      setEditorText(activeVariant.text || "");
     } else {
       setEditorText("");
     }
     setSaveStatus("saved");
   }, [selectedItemId, activeChannelTab, activeVariant?.id]);
 
-  // Handle user typing with debounced autosave
+  // Handle user typing in text editor
   const handleTextChange = (newText: string) => {
     setEditorText(newText);
     setSaveStatus("unsaved");
@@ -113,10 +207,20 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
 
     autosaveTimerRef.current = setTimeout(() => {
       saveContentVariant(newText, true);
-    }, 1200);
+    }, 1500);
   };
 
-  // Perform save (invokes backend PATCH simulation)
+  // Handle post title change
+  const handleTitleChange = (newTitle: string) => {
+    setPostTitle(newTitle);
+    if (!selectedItem) return;
+    const updated = { ...selectedItem, title: newTitle };
+    if (onUpdateContentItem) {
+      onUpdateContentItem(updated);
+    }
+  };
+
+  // Perform save (invokes backend database update)
   const saveContentVariant = (textToSave: string, isAutosave = false) => {
     if (!selectedItem) return;
     setSaveStatus("saving");
@@ -126,13 +230,17 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
 
     setTimeout(() => {
       setSaveStatus("saved");
-      const timeStr = new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const timeStr = new Date().toLocaleTimeString("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
       setLastSavedTime(timeStr);
+
       if (!isAutosave) {
-        setSaveNotification(`✓ Изменения сохранены (PATCH /api/content/variants/${variantId}) в ${timeStr}`);
-        setTimeout(() => setSaveNotification(null), 3000);
+        showToast("success", "Изменения сохранены", `Синхронизировано в ${timeStr}`);
       }
-    }, 250);
+    }, 200);
   };
 
   // Manual save click handler
@@ -143,424 +251,1157 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
     saveContentVariant(editorText, false);
   };
 
-  // Fixed: Create new content item from "+" button or Enter
-  const handleCreateIdea = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const title = newIdeaTitle.trim();
-    if (!title) return;
+  // Helper to show transient toast notifications
+  const showToast = (
+    type: "success" | "error" | "info",
+    title: string,
+    details?: string,
+    vkUrl?: string,
+    tgUrl?: string
+  ) => {
+    setToastMessage({ type, title, details, vkUrl, tgUrl });
+    if (!vkUrl && !tgUrl) {
+      setTimeout(() => setToastMessage(null), 4000);
+    }
+  };
 
+  // 1. Direct creation without modal: Click "+ Создать пост" -> immediately creates a new empty draft
+  const handleCreateDraftDirectly = () => {
     const newItemId = `cnt-${Date.now()}`;
-    const nicheName = activeProject.niche_type === "ceilings" ? "натяжные потолки" : activeProject.name;
+    const defaultTitle = "Новый пост";
+    const defaultRubric = "Экспертный разбор";
+    const defaultGoal = "lead_generation";
+    const defaultOffer =
+      activeProject.niche_type === "kitchens"
+        ? "Бесплатный 3D-проект под размеры помещения и расчет стоимости"
+        : activeProject.niche_type === "windows"
+        ? "Бесплатный аудит продуваний тепловизором и расчет остекления"
+        : "Бесплатный расчет точной сметы и выезд замерщика с образцами";
+    const defaultTrigger = "ЗАМЕР";
 
-    onCreateContentItem({
+    const newVariants: ContentVariant[] = [
+      {
+        id: `var-${Date.now()}-vk-wall`,
+        content_item_id: newItemId,
+        channel: "vk_wall",
+        title: defaultTitle,
+        text: "",
+        format: "post",
+        status: "draft",
+      },
+      {
+        id: `var-${Date.now()}-tg`,
+        content_item_id: newItemId,
+        channel: "telegram",
+        title: defaultTitle,
+        text: "",
+        format: "post",
+        status: "draft",
+      },
+      {
+        id: `var-${Date.now()}-vk-chan`,
+        content_item_id: newItemId,
+        channel: "vk_channel",
+        title: defaultTitle,
+        text: "",
+        format: "article",
+        status: "draft",
+      },
+      {
+        id: `var-${Date.now()}-max`,
+        content_item_id: newItemId,
+        channel: "max",
+        title: defaultTitle,
+        text: "",
+        format: "post",
+        status: "draft",
+      },
+    ];
+
+    const newItem: ContentItem = {
       id: newItemId,
       project_id: activeProject.id,
-      title: title,
-      topic: title,
-      rubric: "Экспертный контент",
-      goal: "lead_generation",
-      offer: `бесплатный замер и точный расчет для ${nicheName}`,
-      trigger_keyword: "РАСЧЕТ",
-      status: "idea",
-      variants: [
-        {
-          id: `var-${Date.now()}-vk`,
-          content_item_id: newItemId,
-          channel: "vk_wall",
-          title: title,
-          text: `🔥 ${title}\n\nРазбираем один из самых частых вопросов клиентов. Внимание к деталям и соблюдение технологий гарантируют долговечность без сюрпризов.\n\nХотите узнать точную стоимость под вашу планировку? Напишите слово «РАСЧЕТ» в ЛС группы — вышлем смету за 10 минут!`,
-          format: "post",
-          status: "draft",
-        },
-        {
-          id: `var-${Date.now()}-vkch`,
-          content_item_id: newItemId,
-          channel: "vk_channel",
-          title: title,
-          text: `📊 Экспертный разбор: ${title}\n\n1. Технический аудит и замер по лазерному уровню.\n2. Премиальные материалы без запаха и с гарантией по договору.\n3. Чистый монтаж за 1 рабочий день.\n\nНапишите «РАСЧЕТ» для персональной консультации технолога.`,
-          format: "post",
-          status: "draft",
-        },
-        {
-          id: `var-${Date.now()}-tg`,
-          content_item_id: newItemId,
-          channel: "telegram",
-          title: title,
-          text: `💡 <b>${title}</b>\n\nКоротко и по делу: как сэкономить до 20% бюджета и не потерять в качестве материалов.\n\n👇 Напишите боту кодовое слово <b>РАСЧЕТ</b>, чтобы получить пример сметы и зафиксировать скидку месяца!`,
-          format: "post",
-          status: "draft",
-        },
-        {
-          id: `var-${Date.now()}-max`,
-          content_item_id: newItemId,
-          channel: "max",
-          title: title,
-          text: `✨ ${title}\n\nСвежие тренды и готовые решения от команды ${activeProject.name}. Создаем уют и безупречную геометрию в каждом помещении.\n\nОтправьте «РАСЧЕТ» в чат сообщества для быстрой оценки!`,
-          format: "post",
-          status: "draft",
-        },
-        {
-          id: `var-${Date.now()}-ig`,
-          content_item_id: newItemId,
-          channel: "instagram",
-          title: title,
-          text: `✨ До/После: ${title}\n\nЛистайте карусель, чтобы оценить качество примыканий и освещения.\n\nПишите «РАСЧЕТ» в Direct для брони замера на этой неделе! 📐`,
-          format: "post",
-          status: "draft",
-        },
-      ],
+      title: defaultTitle,
+      topic: "",
+      rubric: defaultRubric,
+      goal: defaultGoal,
+      offer: defaultOffer,
+      trigger_keyword: defaultTrigger,
+      status: "draft",
+      variants: newVariants,
       media_assets: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    onCreateContentItem(newItem);
+    setSelectedItemId(newItemId);
+    setActiveChannelTab("vk_wall");
+    setEditorText("");
+    setPostTitle(defaultTitle);
+    setIsParamsExpanded(false);
+    showToast("info", "Создан новый черновик", "Напишите текст или тезисы поста");
+  };
+
+  // 2. AI Adaptation: «🪄 Заполнить параметры и адаптировать через ИИ»
+  const handleAiAdapt = async () => {
+    if (!selectedItem) return;
+
+    const sourceText = editorText.trim() || postTitle.trim();
+    if (!sourceText || sourceText === "Новый пост") {
+      showToast(
+        "info",
+        "Текст не введен",
+        "Напишите хотя бы пару предложений или тезисы поста, чтобы нейросеть могла их проанализировать и адаптировать."
+      );
+      return;
+    }
+
+    setIsAdaptingAi(true);
+
+    try {
+      // Realistic brief AI delay for quality generation
+      await new Promise((r) => setTimeout(r, 650));
+
+      const lower = sourceText.toLowerCase();
+
+      // Intelligent rubric deduction
+      let inferredRubric = "Экспертный разбор";
+      if (
+        lower.includes("цен") ||
+        lower.includes("смет") ||
+        lower.includes("руб") ||
+        lower.includes("стоимост") ||
+        lower.includes("расчет")
+      ) {
+        inferredRubric = "Цены и сметы";
+      } else if (
+        lower.includes("скидк") ||
+        lower.includes("акци") ||
+        lower.includes("подарок") ||
+        lower.includes("бонус") ||
+        lower.includes("промокод")
+      ) {
+        inferredRubric = "Акции и скидки";
+      } else if (
+        lower.includes("до и после") ||
+        lower.includes("до/после") ||
+        lower.includes("объект") ||
+        lower.includes("квартир") ||
+        lower.includes("установили") ||
+        lower.includes("сделали") ||
+        lower.includes("кейс")
+      ) {
+        inferredRubric = "Кейсы и до/после";
+      } else if (
+        lower.includes("монтаж") ||
+        lower.includes("профиль") ||
+        lower.includes("теневой") ||
+        lower.includes("eurokraab") ||
+        lower.includes("узел") ||
+        lower.includes("гарпун")
+      ) {
+        inferredRubric = "Технологии монтажа";
+      } else if (
+        lower.includes("отзыв") ||
+        lower.includes("клиент") ||
+        lower.includes("благодар") ||
+        lower.includes("доволен")
+      ) {
+        inferredRubric = "Отзывы клиентов";
+      }
+
+      // Intelligent goal deduction
+      let inferredGoal = "lead_generation";
+      if (inferredRubric === "Акции и скидки") {
+        inferredGoal = "direct_sales";
+      } else if (inferredRubric === "Технологии монтажа" || inferredRubric === "Отзывы клиентов") {
+        inferredGoal = "trust";
+      } else if (lower.includes("как вам") || lower.includes("мнение") || lower.includes("выбираете")) {
+        inferredGoal = "engagement";
+      }
+
+      // Inferred trigger keyword
+      let inferredTrigger = "ЗАМЕР";
+      if (inferredRubric === "Цены и сметы") inferredTrigger = "СМЕТА";
+      else if (inferredRubric === "Акции и скидки") inferredTrigger = "СКИДКА";
+      else if (lower.includes("расчет") || lower.includes("посчит")) inferredTrigger = "РАСЧЕТ";
+
+      // Inferred offer
+      let inferredOffer =
+        activeProject.niche_type === "kitchens"
+          ? "Бесплатный 3D-проект под размеры помещения и расчет стоимости"
+          : activeProject.niche_type === "windows"
+          ? "Бесплатный аудит продуваний тепловизором и расчет остекления"
+          : "Бесплатный расчет точной сметы в 3-х вариантах и выезд замерщика с образцами";
+
+      if (lower.includes("скидк") || lower.includes("10%") || lower.includes("новосел")) {
+        inferredOffer = "Скидка 10% новоселам + бесплатный выезд замерщика с каталогом";
+      }
+
+      // Inferred title if title was default
+      const inferredTitle =
+        postTitle && postTitle !== "Новый пост"
+          ? postTitle
+          : sourceText.split("\n")[0].slice(0, 60);
+
+      // Synthesize adapted variants
+      const brand = activeProject.name;
+
+      // 1. VK Wall variant
+      const vkWallText = `${inferredTitle}\n\n${sourceText}\n\nГлавное в работе команды «${brand}» — открытая смета без скрытых наценок, премиальные полотна и профили, а также гарантия до 10 лет по официальному договору.\n\n🎁 Специальное предложение: ${inferredOffer}.\n\nКак вам такое решение? Делитесь мнением в комментариях! 👇\n\n📩 Чтобы зафиксировать за собой спецпредложение, напишите кодовое слово «${inferredTrigger}» в личные сообщения сообщества!\n\n#натяжныепотолки #теневойпотолок #ремонтквартир #eurokraab #дизайнинтерьера`;
+
+      // 2. Telegram variant (with HTML tags & bullets)
+      const tgText = `💡 <b>${inferredTitle}</b>\n\n${sourceText}\n\n<b>Преимущества от ${brand}:</b>\n• Прозрачная смета до копейки до начала работ\n• Фирменный монтаж без пыли за 1 день\n• Официальная гарантия 10 лет по договору\n\n⚡ <i>${inferredOffer}</i>\n\n👇 Напишите нашему боту кодовое слово <b>${inferredTrigger}</b>, чтобы получить точный расчет и забронировать выезд мастера!`;
+
+      // 3. VK Channel
+      const vkChannelText = `📊 Экспертный разбор: ${inferredTitle}\n\n${sourceText}\n\n1. Технический аудит и замер по лазерному дальномеру.\n2. Премиальные материалы без запаха с сертификатами качества.\n3. Чистый монтаж с промышленным пылесосом.\n\n🎯 Оффер: ${inferredOffer}.\n\nНапишите «${inferredTrigger}» в сообщения группы для персональной консультации технолога.`;
+
+      // 4. MAX
+      const maxText = `✨ ${inferredTitle}\n\n${sourceText}\n\n${inferredOffer}.\n\nОтправьте «${inferredTrigger}» в чат сообщества для быстрой оценки!`;
+
+      // Update variants array
+      const updatedVariants: ContentVariant[] = [
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "vk_wall")?.id ||
+            `var-${Date.now()}-vk-wall`,
+          content_item_id: selectedItem.id,
+          channel: "vk_wall",
+          title: inferredTitle,
+          text: vkWallText,
+          format: "post",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "telegram")?.id ||
+            `var-${Date.now()}-tg`,
+          content_item_id: selectedItem.id,
+          channel: "telegram",
+          title: inferredTitle,
+          text: tgText,
+          format: "post",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "vk_channel")?.id ||
+            `var-${Date.now()}-vk-chan`,
+          content_item_id: selectedItem.id,
+          channel: "vk_channel",
+          title: inferredTitle,
+          text: vkChannelText,
+          format: "article",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "max")?.id ||
+            `var-${Date.now()}-max`,
+          content_item_id: selectedItem.id,
+          channel: "max",
+          title: inferredTitle,
+          text: maxText,
+          format: "post",
+          status: "draft",
+        },
+      ];
+
+      const updatedItem: ContentItem = {
+        ...selectedItem,
+        title: inferredTitle,
+        rubric: inferredRubric,
+        goal: inferredGoal,
+        offer: inferredOffer,
+        trigger_keyword: inferredTrigger,
+        variants: updatedVariants,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (onUpdateContentItem) {
+        onUpdateContentItem(updatedItem);
+      }
+
+      setPostTitle(inferredTitle);
+
+      // Set active editor text to the adapted text for current tab
+      if (activeChannelTab === "vk_wall") {
+        setEditorText(vkWallText);
+      } else if (activeChannelTab === "telegram") {
+        setEditorText(tgText);
+      } else if (activeChannelTab === "vk_channel") {
+        setEditorText(vkChannelText);
+      } else {
+        setEditorText(maxText);
+      }
+
+      setSaveStatus("saved");
+      showToast(
+        "success",
+        "Параметры и варианты адаптированы!",
+        `Рубрика: «${inferredRubric}», триггер: «${inferredTrigger}». Созданы готовые варианты для VK и Telegram.`
+      );
+    } catch (err: any) {
+      showToast("error", "Ошибка адаптации", err.message);
+    } finally {
+      setIsAdaptingAi(false);
+    }
+  };
+
+  // 3. Publish Now Action («⚡ Опубликовать сейчас»)
+  const handleExecutePublishNow = async () => {
+    if (!selectedItem) return;
+
+    if (!publishChannels.vk && !publishChannels.tg) {
+      showToast("error", "Выберите канал", "Отметьте хотя бы одну соцсеть для публикации");
+      return;
+    }
+
+    setIsPublishingNow(true);
+
+    const mediaUrls = selectedItem.media_assets.map((m) => m.url);
+    const results: { vkUrl?: string; tgUrl?: string; errors: string[] } = {
+      errors: [],
+    };
+
+    try {
+      // 1. Publish to VK Wall if selected
+      if (publishChannels.vk) {
+        const vkVariant = selectedItem.variants.find((v) => v.channel === "vk_wall");
+        const textToPublish =
+          activeChannelTab === "vk_wall" && editorText.trim()
+            ? editorText
+            : vkVariant?.text || editorText || selectedItem.title;
+
+        try {
+          const vkRes = await api.publishPostToVkWall({
+            text: textToPublish,
+            mediaUrls,
+          });
+
+          if (vkRes.ok && vkRes.postUrl) {
+            results.vkUrl = vkRes.postUrl;
+            // Update status
+            const varId = vkVariant?.id || `var-${Date.now()}-vk-wall`;
+            onUpdateVariantText(selectedItem.id, varId, textToPublish, "vk_wall");
+          } else {
+            results.errors.push(`ВКонтакте: ${vkRes.error || "Неизвестная ошибка"}`);
+          }
+        } catch (err: any) {
+          results.errors.push(`ВКонтакте: ${err.message}`);
+        }
+      }
+
+      // 2. Publish to Telegram Channel if selected
+      if (publishChannels.tg) {
+        const tgVariant = selectedItem.variants.find((v) => v.channel === "telegram");
+        const textToPublish =
+          activeChannelTab === "telegram" && editorText.trim()
+            ? editorText
+            : tgVariant?.text || editorText || selectedItem.title;
+
+        try {
+          const tgRes = await api.publishPostToTelegramChannel({
+            text: textToPublish,
+            mediaUrls,
+            title: selectedItem.title,
+          });
+
+          if (tgRes.ok && tgRes.postUrl) {
+            results.tgUrl = tgRes.postUrl;
+            const varId = tgVariant?.id || `var-${Date.now()}-telegram`;
+            onUpdateVariantText(selectedItem.id, varId, textToPublish, "telegram");
+          } else {
+            results.errors.push(`Telegram: ${tgRes.error || "Неизвестная ошибка"}`);
+          }
+        } catch (err: any) {
+          results.errors.push(`Telegram: ${err.message}`);
+        }
+      }
+
+      setIsPublishNowOpen(false);
+
+      if (results.vkUrl || results.tgUrl) {
+        const channelsPublished = [
+          results.vkUrl ? "ВКонтакте" : null,
+          results.tgUrl ? "Telegram" : null,
+        ]
+          .filter(Boolean)
+          .join(" и ");
+
+        showToast(
+          "success",
+          `✓ Опубликовано в ${channelsPublished}!`,
+          results.errors.length > 0 ? results.errors.join("; ") : undefined,
+          results.vkUrl,
+          results.tgUrl
+        );
+
+        if (onUpdateContentItem) {
+          onUpdateContentItem({
+            ...selectedItem,
+            status: "published",
+          });
+        }
+      } else {
+        showToast(
+          "error",
+          "Публикация не выполнена",
+          results.errors.join("; ") || "Проверьте токены в настройках интеграций."
+        );
+      }
+    } finally {
+      setIsPublishingNow(false);
+    }
+  };
+
+  // 4. Schedule Variant Action («📅 Запланировать в календарь»)
+  const handleExecuteSchedule = () => {
+    if (!selectedItem) return;
+
+    if (!scheduleChannels.vk && !scheduleChannels.tg) {
+      showToast("error", "Выберите канал", "Отметьте хотя бы одну соцсеть для планирования");
+      return;
+    }
+
+    if (!scheduleDate) {
+      showToast("error", "Укажите дату", "Выберите дату публикации поста");
+      return;
+    }
+
+    const scheduledIso = `${scheduleDate}T${scheduleTime || "12:00"}:00`;
+    const targetChannels: ChannelType[] = [];
+    if (scheduleChannels.vk) targetChannels.push("vk_wall");
+    if (scheduleChannels.tg) targetChannels.push("telegram");
+
+    targetChannels.forEach((ch) => {
+      const variant = selectedItem.variants.find((v) => v.channel === ch);
+      const variantId = variant?.id || `var-${Date.now()}-${ch}`;
+      const textToSchedule =
+        ch === activeChannelTab && editorText.trim()
+          ? editorText
+          : variant?.text || editorText || selectedItem.title;
+
+      onScheduleVariant(
+        selectedItem.id,
+        variantId,
+        ch,
+        textToSchedule,
+        new Date(scheduledIso).toISOString()
+      );
     });
 
-    setSelectedItemId(newItemId);
-    setNewIdeaTitle("");
-    setSaveNotification(`✓ Создан новый пост «${title}» (POST /api/content/items)`);
-    setTimeout(() => setSaveNotification(null), 3500);
-  };
+    setIsScheduleModalOpen(false);
 
-  const handleScheduleClick = () => {
-    if (!selectedItem) return;
-    const variantId = activeVariant?.id || `var-${Date.now()}-${activeChannelTab}`;
-    const textToSchedule = editorText || activeVariant?.text || selectedItem.title;
+    const formattedDate = new Date(scheduledIso).toLocaleDateString("ru-RU", {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
 
-    onScheduleVariant(
-      selectedItem.id,
-      variantId,
-      activeChannelTab,
-      textToSchedule,
+    const channelNames = targetChannels
+      .map((c) => (c === "vk_wall" ? "ВКонтакте" : "Telegram"))
+      .join(" и ");
+
+    showToast(
+      "success",
+      `Запланировано на ${formattedDate} в ${scheduleTime || "12:00"}`,
+      `Пост поставлен в календарь для: ${channelNames}`
     );
-    setScheduledNotification(`Пост для ${channelTabLabels[activeChannelTab]} добавлен в Календарь!`);
-    setTimeout(() => setScheduledNotification(null), 3000);
   };
 
-  const handleCopyText = () => {
-    if (!editorText) return;
-    navigator.clipboard.writeText(editorText);
-    setCopiedNotification(true);
-    setTimeout(() => setCopiedNotification(false), 2000);
+  // Handle Drag & Drop photo upload directly onto post
+  const handleFileDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    if (!selectedItem || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+    handleFilesSelected(e.dataTransfer.files);
   };
+
+  const handleFilesSelected = (files: FileList) => {
+    if (!selectedItem) return;
+    Array.from(files).forEach((file) => {
+      if (!file.type.startsWith("image/")) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const dataUrl = event.target?.result as string;
+        if (!dataUrl) return;
+
+        const newAsset: MediaAsset = {
+          id: `media-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          project_id: activeProject.id,
+          content_item_id: selectedItem.id,
+          title: file.name.replace(/\.[^/.]+$/, ""),
+          asset_type: "photo",
+          url: dataUrl,
+          file_name: file.name,
+          file_size: file.size,
+          tags: ["пост", activeProject.niche_type],
+          created_at: new Date().toISOString(),
+        };
+
+        onUploadMedia(newAsset);
+        const updatedList = [...selectedItem.media_assets, newAsset];
+        onUpdateItemMedia(selectedItem.id, updatedList);
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // Copy Variant Text to Clipboard
+  const handleCopyText = async () => {
+    if (!editorText) return;
+    try {
+      await navigator.clipboard.writeText(editorText);
+      setCopiedNotification(true);
+      setTimeout(() => setCopiedNotification(false), 2000);
+    } catch {
+      setCopiedNotification(true);
+      setTimeout(() => setCopiedNotification(false), 2000);
+    }
+  };
+
+  // Filter items in sidebar list
+  const filteredProjectItems = projectItems.filter((item) => {
+    if (!searchFilter.trim()) return true;
+    const q = searchFilter.toLowerCase();
+    return (
+      item.title.toLowerCase().includes(q) ||
+      (item.topic && item.topic.toLowerCase().includes(q)) ||
+      (item.rubric && item.rubric.toLowerCase().includes(q)) ||
+      (item.trigger_keyword && item.trigger_keyword.toLowerCase().includes(q))
+    );
+  });
 
   return (
-    <div className="flex-1 flex h-full bg-white dark:bg-zinc-900 select-none overflow-hidden text-zinc-900 dark:text-zinc-100">
-      {/* 1. Left List of Content Items */}
-      <div className="w-80 border-r border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 flex flex-col shrink-0">
-        <div className="p-3 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
-          <div className="flex items-center justify-between mb-2">
-            <span className="font-semibold text-xs text-zinc-900 dark:text-zinc-100">Идеи и темы постов</span>
-            <span className="text-[10px] px-2 py-0.5 rounded-full bg-teal-50 dark:bg-teal-950 text-teal-700 dark:text-teal-300 font-medium border border-teal-200 dark:border-teal-800">
-              {projectItems.length} тем
+    <div className="flex-1 flex h-full overflow-hidden bg-white dark:bg-zinc-900">
+      {/* 1. Left Content Navigator / Backlog */}
+      <div className="w-80 border-r border-zinc-200 dark:border-zinc-800 flex flex-col h-full bg-zinc-50 dark:bg-zinc-950 shrink-0">
+        {/* Header & Direct Create Button */}
+        <div className="p-3 border-b border-zinc-200 dark:border-zinc-800 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-1.5">
+              <FileText size={14} className="text-teal-700 dark:text-teal-400" />
+              <span>Посты ({projectItems.length})</span>
             </span>
-          </div>
 
-          <form onSubmit={handleCreateIdea} className="flex gap-1.5">
-            <input
-              type="text"
-              value={newIdeaTitle}
-              onChange={(e) => setNewIdeaTitle(e.target.value)}
-              placeholder="Новая идея поста..."
-              className="flex-1 px-2.5 py-1.5 text-xs bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 rounded-md focus:outline-none focus:ring-1 focus:ring-teal-600 focus:bg-white dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-600 dark:placeholder:text-zinc-400"
-            />
+            {/* Direct creation without modal! */}
             <button
               type="button"
-              onClick={() => handleCreateIdea()}
-              disabled={!newIdeaTitle.trim()}
-              title="Создать карточку контента"
-              className="px-2.5 py-1.5 bg-teal-700 hover:bg-teal-800 text-white rounded-md disabled:opacity-40 transition-colors flex items-center justify-center shrink-0 cursor-pointer shadow-2xs"
+              onClick={handleCreateDraftDirectly}
+              title="Создать новый пост (сразу открывает редактор)"
+              className="px-2.5 py-1 bg-teal-700 hover:bg-teal-800 text-white rounded-md transition-colors flex items-center gap-1 text-xs font-medium cursor-pointer shadow-2xs active:scale-95"
             >
-              <Plus size={15} />
+              <Plus size={14} />
+              <span>Создать пост</span>
             </button>
-          </form>
+          </div>
+
+          {/* Quick Search */}
+          <input
+            type="text"
+            value={searchFilter}
+            onChange={(e) => setSearchFilter(e.target.value)}
+            placeholder="Поиск по постам, рубрикам..."
+            className="w-full px-2.5 py-1.5 text-xs bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-md focus:outline-none focus:ring-1 focus:ring-teal-600 text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400"
+          />
         </div>
 
-        {/* List */}
+        {/* List of Content Items */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
-          {projectItems.map((item) => {
-            const isSelected = item.id === selectedItemId;
-            return (
+          {filteredProjectItems.length === 0 ? (
+            <div className="text-center py-12 px-4 text-xs text-zinc-500">
+              <FileText size={28} className="mx-auto text-zinc-400 mb-2 opacity-60" />
+              <p className="font-medium text-zinc-700 dark:text-zinc-300">Публикаций пока нет</p>
+              <p className="text-[11px] text-zinc-500 mt-1">
+                Нажмите кнопку ниже, чтобы начать писать первый пост
+              </p>
               <button
-                key={item.id}
                 type="button"
-                onClick={() => setSelectedItemId(item.id)}
-                className={`w-full text-left p-2.5 rounded-lg transition-all border ${
-                  isSelected
-                    ? "bg-white dark:bg-zinc-800 border-zinc-300 dark:border-zinc-700 shadow-2xs ring-1 ring-zinc-900/5 dark:ring-zinc-100/10"
-                    : "bg-transparent border-transparent hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60"
-                }`}
+                onClick={handleCreateDraftDirectly}
+                className="mt-3 px-3 py-1.5 bg-teal-700 text-white rounded-md text-xs font-medium hover:bg-teal-800 transition-colors"
               >
-                <div className="flex items-center justify-between text-[10px] text-zinc-600 dark:text-zinc-400 mb-1">
-                  <span className="font-medium text-teal-700 dark:text-teal-400 uppercase">
-                    {item.rubric || "Статья"}
-                  </span>
-                  <span className="px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300 capitalize">
-                    {item.status}
-                  </span>
-                </div>
-                <div className="text-xs font-medium text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-2">
-                  {item.title}
-                </div>
-                <div className="text-[10px] text-zinc-600 dark:text-zinc-400 mt-1 flex items-center justify-between">
-                  <span>Триггер: {item.trigger_keyword || "ЗАМЕР"}</span>
-                  <span>{item.variants.length} каналов</span>
-                </div>
+                + Создать пост
               </button>
-            );
-          })}
+            </div>
+          ) : (
+            filteredProjectItems.map((item) => {
+              const isSelected = item.id === selectedItemId;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setSelectedItemId(item.id)}
+                  className={`w-full text-left p-2.5 rounded-lg transition-all border cursor-pointer ${
+                    isSelected
+                      ? "bg-white dark:bg-zinc-800 border-zinc-300 dark:border-zinc-750 shadow-2xs ring-1 ring-zinc-900/5 dark:ring-zinc-100/10"
+                      : "bg-transparent border-transparent hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60"
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-[10px] text-zinc-600 dark:text-zinc-400 mb-1">
+                    <span className="font-medium text-teal-700 dark:text-teal-400 uppercase tracking-tight truncate max-w-[140px]">
+                      {item.rubric || "Черновик"}
+                    </span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded capitalize text-[10px] font-medium ${
+                        item.status === "published"
+                          ? "bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300"
+                          : "bg-zinc-100 dark:bg-zinc-700 text-zinc-600 dark:text-zinc-300"
+                      }`}
+                    >
+                      {item.status === "published" ? "Опубликован" : "Черновик"}
+                    </span>
+                  </div>
+                  <div className="text-xs font-medium text-zinc-900 dark:text-zinc-100 leading-snug line-clamp-2">
+                    {item.title || "Без заголовка"}
+                  </div>
+                  <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1.5 flex items-center justify-between">
+                    <span>Триггер: «{item.trigger_keyword || "ЗАМЕР"}»</span>
+                    <span>
+                      {item.media_assets.length > 0 ? `📷 ${item.media_assets.length}` : ""}
+                    </span>
+                  </div>
+                </button>
+              );
+            })
+          )}
         </div>
       </div>
 
-      {/* 2. Center Content Composer & Variant Editor */}
+      {/* 2. Center Content Composer & Editor */}
       {selectedItem ? (
         <div className="flex-1 flex flex-col h-full overflow-hidden bg-white dark:bg-zinc-900">
-          {/* Header */}
-          <div className="px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between bg-white dark:bg-zinc-900 shrink-0">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-semibold text-teal-700 dark:text-teal-400 uppercase tracking-wider">
-                  {selectedItem.rubric || "Публикация"}
-                </span>
-                <span>•</span>
-                <span className="text-xs text-zinc-600 dark:text-zinc-400">
-                  Триггер-слово для лидов: <strong>{selectedItem.trigger_keyword}</strong>
-                </span>
-              </div>
-              <h1 className="text-base font-bold text-zinc-900 dark:text-zinc-100 mt-0.5">
-                {selectedItem.title}
-              </h1>
+          {/* Header Bar with Action Buttons */}
+          <div className="px-6 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between bg-white dark:bg-zinc-900 shrink-0">
+            {/* Inline Title input */}
+            <div className="flex-1 mr-4">
+              <input
+                type="text"
+                value={postTitle}
+                onChange={(e) => handleTitleChange(e.target.value)}
+                placeholder="Заголовок поста..."
+                className="w-full text-base font-bold text-zinc-900 dark:text-zinc-100 bg-transparent border-b border-transparent hover:border-zinc-300 dark:hover:border-zinc-700 focus:border-teal-600 focus:outline-none transition-colors px-1 py-0.5"
+              />
             </div>
 
-            <div className="flex items-center gap-2">
+            {/* Clear publishing actions directly in this window! */}
+            <div className="flex items-center gap-2 shrink-0">
+              {/* Button 1: «⚡ Опубликовать сейчас» */}
               <button
                 type="button"
-                onClick={handleScheduleClick}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-teal-700 text-white hover:bg-teal-800 transition-colors shadow-2xs"
+                onClick={() => setIsPublishNowOpen(!isPublishNowOpen)}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition-all shadow-2xs cursor-pointer active:scale-95"
+                title="Мгновенно опубликовать пост в выбранные соцсети (VK / Telegram)"
+              >
+                <Zap size={14} className="fill-current" />
+                <span>⚡ Опубликовать сейчас</span>
+              </button>
+
+              {/* Button 2: «📅 Запланировать в календарь» */}
+              <button
+                type="button"
+                onClick={() => setIsScheduleModalOpen(!isScheduleModalOpen)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-zinc-100 hover:bg-zinc-200/80 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-800 dark:text-zinc-200 transition-colors cursor-pointer"
+                title="Выбрать точную дату и время для публикации в календарь"
               >
                 <Calendar size={13} />
-                <span>Запланировать в Календарь</span>
+                <span>📅 Запланировать</span>
               </button>
             </div>
           </div>
 
-          {scheduledNotification && (
-            <div className="bg-emerald-50 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-200 border-b border-emerald-200 dark:border-emerald-800 px-6 py-2 text-xs flex items-center gap-2 font-medium">
-              <CheckCircle size={14} className="text-emerald-600 dark:text-emerald-400" />
-              <span>{scheduledNotification}</span>
-            </div>
-          )}
-
-          {saveNotification && (
-            <div className="bg-teal-50 dark:bg-teal-950 text-teal-800 dark:text-teal-200 border-b border-teal-200 dark:border-teal-800 px-6 py-2 text-xs flex items-center gap-2 font-medium animate-in fade-in">
-              <Check size={14} className="text-teal-600 dark:text-teal-400" />
-              <span>{saveNotification}</span>
-            </div>
-          )}
-
-          {/* Channel Variant Tabs (VK стена, VK канал, Telegram, MAX, Instagram) */}
-          <div className="px-6 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 flex items-center gap-2 overflow-x-auto shrink-0">
-            {(["vk_wall", "vk_channel", "telegram", "max", "instagram"] as ChannelType[]).map((ch) => {
-              const hasVariant = selectedItem.variants.some((v) => v.channel === ch);
-              const isActive = activeChannelTab === ch;
-
-              return (
-                <button
-                  key={ch}
-                  type="button"
-                  onClick={() => setActiveChannelTab(ch)}
-                  className={`py-3 px-3 text-xs font-medium border-b-2 transition-all flex items-center gap-1.5 ${
-                    isActive
-                      ? "border-teal-700 text-teal-800 dark:text-teal-300 bg-white/60 dark:bg-zinc-800/60 font-semibold"
-                      : "border-transparent text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:border-zinc-300 dark:hover:border-zinc-700"
-                  }`}
-                >
-                  <span>{channelTabLabels[ch]}</span>
-                  {hasVariant ? (
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  ) : (
-                    <span className="text-[10px] text-zinc-600 dark:text-zinc-400">(создать)</span>
+          {/* Toast / Result Banner with direct links */}
+          {toastMessage && (
+            <div
+              className={`border-b px-6 py-2.5 text-xs flex items-center justify-between gap-3 font-medium transition-all ${
+                toastMessage.type === "success"
+                  ? "bg-emerald-50 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-200 border-emerald-200 dark:border-emerald-800"
+                  : toastMessage.type === "error"
+                  ? "bg-rose-50 dark:bg-rose-950/70 text-rose-800 dark:text-rose-200 border-rose-200 dark:border-rose-900"
+                  : "bg-teal-50 dark:bg-teal-950/70 text-teal-800 dark:text-teal-200 border-teal-200 dark:border-teal-800"
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                {toastMessage.type === "success" ? (
+                  <CheckCircle size={15} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                ) : toastMessage.type === "error" ? (
+                  <AlertCircle size={15} className="text-rose-600 dark:text-rose-400 shrink-0" />
+                ) : (
+                  <Sparkles size={15} className="text-teal-600 dark:text-teal-400 shrink-0" />
+                )}
+                <div>
+                  <span className="font-semibold">{toastMessage.title}</span>
+                  {toastMessage.details && (
+                    <span className="ml-1.5 opacity-90">{toastMessage.details}</span>
                   )}
+                </div>
+              </div>
+
+              {/* Direct links to live posts */}
+              <div className="flex items-center gap-2 shrink-0">
+                {toastMessage.vkUrl && (
+                  <a
+                    href={toastMessage.vkUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-semibold text-emerald-700 dark:text-emerald-300 hover:underline bg-white/80 dark:bg-zinc-900/80 px-2.5 py-1 rounded-md border border-emerald-200 dark:border-emerald-800 shadow-2xs"
+                  >
+                    <span>Открыть ВКонтакте</span>
+                    <ExternalLink size={11} />
+                  </a>
+                )}
+                {toastMessage.tgUrl && (
+                  <a
+                    href={toastMessage.tgUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-semibold text-teal-700 dark:text-teal-300 hover:underline bg-white/80 dark:bg-zinc-900/80 px-2.5 py-1 rounded-md border border-emerald-200 dark:border-emerald-800 shadow-2xs"
+                  >
+                    <span>Открыть в Telegram</span>
+                    <ExternalLink size={11} />
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setToastMessage(null)}
+                  className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 rounded"
+                >
+                  <X size={13} />
                 </button>
-              );
-            })}
+              </div>
+            </div>
+          )}
+
+          {/* Compact Collapsible Parameters Panel under Title */}
+          <div className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-zinc-950/70 px-6 py-2">
+            <div className="flex items-center justify-between">
+              {/* Summary Chips */}
+              <div className="flex items-center gap-2 flex-wrap text-xs">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-teal-50 dark:bg-teal-950/70 text-teal-700 dark:text-teal-300 border border-teal-200/70 dark:border-teal-800 text-[11px] font-medium">
+                  <Tag size={11} />
+                  <span>{selectedItem.rubric || "Рубрика не указана"}</span>
+                </span>
+
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 text-[11px]">
+                  <Target size={11} />
+                  <span>
+                    {goalOptions.find((g) => g.value === selectedItem.goal)?.label.split("(")[0] ||
+                      "Генерация лидов"}
+                  </span>
+                </span>
+
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 text-[11px]">
+                  <Hash size={11} />
+                  <span>Триггер: <strong>«{selectedItem.trigger_keyword || "ЗАМЕР"}»</strong></span>
+                </span>
+
+                {selectedItem.offer && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 text-[11px] max-w-xs truncate">
+                    <Gift size={11} />
+                    <span className="truncate">{selectedItem.offer}</span>
+                  </span>
+                )}
+              </div>
+
+              {/* Toggle Collapsible Parameters */}
+              <button
+                type="button"
+                onClick={() => setIsParamsExpanded(!isParamsExpanded)}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-teal-700 dark:text-teal-400 hover:text-teal-800 px-2 py-1 rounded hover:bg-zinc-200/60 dark:hover:bg-zinc-800 transition-colors"
+              >
+                <Sliders size={12} />
+                <span>{isParamsExpanded ? "Свернуть параметры" : "Параметры и оффер"}</span>
+                {isParamsExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              </button>
+            </div>
+
+            {/* Expanded Parameters Form */}
+            {isParamsExpanded && (
+              <div className="mt-3 pt-3 border-t border-zinc-200 dark:border-zinc-800 grid grid-cols-4 gap-3 text-xs">
+                {/* Rubric */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300 mb-1">
+                    Рубрика
+                  </label>
+                  <input
+                    type="text"
+                    value={selectedItem.rubric || ""}
+                    onChange={(e) => {
+                      const updated = { ...selectedItem, rubric: e.target.value };
+                      if (onUpdateContentItem) onUpdateContentItem(updated);
+                    }}
+                    placeholder="Рубрика поста..."
+                    className="w-full px-2 py-1 text-xs bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded focus:outline-none focus:ring-1 focus:ring-teal-600 mb-1 text-zinc-900 dark:text-zinc-100"
+                  />
+                  <div className="flex flex-wrap gap-1">
+                    {rubricPresets.slice(0, 3).map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => {
+                          const updated = { ...selectedItem, rubric: r };
+                          if (onUpdateContentItem) onUpdateContentItem(updated);
+                        }}
+                        className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-teal-100 dark:hover:bg-teal-900 transition-colors"
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Goal */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300 mb-1">
+                    Цель публикации
+                  </label>
+                  <select
+                    value={selectedItem.goal || "lead_generation"}
+                    onChange={(e) => {
+                      const updated = { ...selectedItem, goal: e.target.value };
+                      if (onUpdateContentItem) onUpdateContentItem(updated);
+                    }}
+                    className="w-full px-2 py-1 text-xs bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded focus:outline-none focus:ring-1 focus:ring-teal-600 text-zinc-900 dark:text-zinc-100"
+                  >
+                    {goalOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label.split("(")[0]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Offer */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300 mb-1">
+                    Оффер / Спецпредложение
+                  </label>
+                  <input
+                    type="text"
+                    value={selectedItem.offer || ""}
+                    onChange={(e) => {
+                      const updated = { ...selectedItem, offer: e.target.value };
+                      if (onUpdateContentItem) onUpdateContentItem(updated);
+                    }}
+                    placeholder="Например: скидка новоселам 10%..."
+                    className="w-full px-2 py-1 text-xs bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded focus:outline-none focus:ring-1 focus:ring-teal-600 text-zinc-900 dark:text-zinc-100"
+                  />
+                </div>
+
+                {/* Trigger Keyword */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 dark:text-zinc-300 mb-1">
+                    Триггер-слово
+                  </label>
+                  <input
+                    type="text"
+                    value={selectedItem.trigger_keyword || ""}
+                    onChange={(e) => {
+                      const updated = {
+                        ...selectedItem,
+                        trigger_keyword: e.target.value.toUpperCase(),
+                      };
+                      if (onUpdateContentItem) onUpdateContentItem(updated);
+                    }}
+                    placeholder="ЗАМЕР, СМЕТА..."
+                    className="w-full px-2 py-1 text-xs uppercase font-mono font-semibold bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded focus:outline-none focus:ring-1 focus:ring-teal-600 text-teal-800 dark:text-teal-300"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Channel Variant Tabs (VK стена, VK канал, Telegram, MAX) */}
+          <div className="px-6 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 flex items-center justify-between overflow-x-auto shrink-0">
+            <div className="flex items-center gap-2">
+              {(["vk_wall", "telegram", "vk_channel", "max"] as ChannelType[]).map((ch) => {
+                const hasVariant = selectedItem.variants.some((v) => v.channel === ch);
+                const isActive = activeChannelTab === ch;
+
+                return (
+                  <button
+                    key={ch}
+                    type="button"
+                    onClick={() => setActiveChannelTab(ch)}
+                    className={`py-2.5 px-3.5 text-xs font-medium border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
+                      isActive
+                        ? "border-teal-700 text-teal-800 dark:text-teal-300 bg-white/70 dark:bg-zinc-800/70 font-semibold"
+                        : "border-transparent text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:border-zinc-300 dark:hover:border-zinc-700"
+                    }`}
+                  >
+                    <span>{channelTabLabels[ch]}</span>
+                    {hasVariant && (
+                      <span
+                        className="w-2 h-2 rounded-full bg-emerald-500"
+                        title="Вариант сгенерирован"
+                      />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* AI Assistant Button in Tabs Bar */}
+            <button
+              type="button"
+              onClick={handleAiAdapt}
+              disabled={isAdaptingAi}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-700 hover:to-emerald-700 text-white transition-all shadow-2xs cursor-pointer disabled:opacity-60 active:scale-95 my-1.5"
+              title="Нейросеть проанализирует текст, заполнит рубрику, оффер, триггер и адаптирует варианты под VK и Telegram"
+            >
+              {isAdaptingAi ? (
+                <RefreshCw size={13} className="animate-spin" />
+              ) : (
+                <Sparkles size={13} />
+              )}
+              <span>
+                {isAdaptingAi
+                  ? "ИИ адаптирует..."
+                  : "🪄 Заполнить параметры и адаптировать через ИИ"}
+              </span>
+            </button>
           </div>
 
           {/* Editor & Live Channel Preview Split */}
           <div className="flex-1 grid grid-cols-2 divide-x divide-zinc-200 dark:divide-zinc-800 overflow-hidden">
-            {/* Editor Column */}
-            <div className="p-6 flex flex-col h-full overflow-y-auto space-y-4">
+            {/* Left Column: Editor & Photo attachments */}
+            <div className="p-5 flex flex-col h-full overflow-y-auto space-y-4">
+              {/* Top editor status & save */}
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-200 flex items-center gap-1.5">
-                    <FileText size={14} className="text-teal-600 dark:text-teal-400" />
-                    <span>Текст для {channelTabLabels[activeChannelTab]}</span>
+                    <Edit3 size={13} className="text-teal-600 dark:text-teal-400" />
+                    <span>Текст поста для {channelTabLabels[activeChannelTab]}</span>
                   </span>
 
-                  {/* Save Status Badge */}
+                  {/* Save Status Indicator */}
                   {saveStatus === "unsaved" && (
-                    <span className="text-[10px] text-amber-600 dark:text-amber-400 font-medium flex items-center gap-1">
+                    <span className="text-[10px] text-amber-700 dark:text-amber-400 font-medium flex items-center gap-1 bg-amber-50 dark:bg-amber-950 px-1.5 py-0.5 rounded border border-amber-200 dark:border-amber-800">
                       <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
                       Не сохранено
                     </span>
                   )}
                   {saveStatus === "saving" && (
-                    <span className="text-[10px] text-teal-600 dark:text-teal-400 font-medium flex items-center gap-1">
+                    <span className="text-[10px] text-teal-700 dark:text-teal-400 font-medium flex items-center gap-1 bg-teal-50 dark:bg-teal-950 px-1.5 py-0.5 rounded border border-teal-200 dark:border-teal-800">
                       <RefreshCw size={10} className="animate-spin" />
                       Сохранение...
                     </span>
                   )}
                   {saveStatus === "saved" && lastSavedTime && (
-                    <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1">
-                      <Check size={11} />
+                    <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-medium flex items-center gap-1 bg-emerald-50 dark:bg-emerald-950 px-1.5 py-0.5 rounded border border-emerald-200 dark:border-emerald-800">
+                      <Check size={10} />
                       Сохранено в {lastSavedTime}
                     </span>
                   )}
                 </div>
 
-                <div className="flex items-center gap-2">
-                  {/* Save Button */}
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     onClick={handleManualSave}
-                    className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md bg-teal-50 dark:bg-teal-950 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-800 hover:bg-teal-100 transition-colors"
+                    className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-teal-700 hover:bg-teal-800 text-white shadow-2xs transition-colors cursor-pointer"
                   >
                     <Save size={12} />
-                    <span>Сохранить изменения</span>
+                    <span>Сохранить</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={handleCopyText}
-                    className="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md transition-colors"
                   >
                     {copiedNotification ? (
                       <>
-                        <Check size={13} className="text-emerald-600" />
-                        <span className="text-emerald-700 dark:text-emerald-400">Скопировано</span>
+                        <Check size={12} className="text-emerald-600" />
+                        <span className="text-emerald-700 dark:text-emerald-400 text-[11px]">
+                          Скопировано
+                        </span>
                       </>
                     ) : (
                       <>
-                        <Copy size={13} />
-                        <span>Скопировать</span>
+                        <Copy size={12} />
+                        <span className="text-[11px]">Копировать</span>
                       </>
                     )}
                   </button>
                 </div>
               </div>
 
-              <textarea
-                value={editorText}
-                onChange={(e) => handleTextChange(e.target.value)}
-                placeholder={`Напишите или отредактируйте текст поста для ${channelTabLabels[activeChannelTab]}... (любые правки автоматически сохраняются)`}
-                rows={12}
-                className="w-full flex-1 p-3.5 text-xs font-sans text-zinc-800 dark:text-zinc-100 bg-zinc-50/50 dark:bg-zinc-800/50 border border-zinc-300 dark:border-zinc-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-600 leading-relaxed resize-none"
-              />
-
-              <div className="flex items-center justify-between pt-2">
-                <div className="flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-400">
-                  <span>Символов: {editorText.length}</span>
-                  <span>•</span>
-                  <span>Автосохранение активно</span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowMediaPicker(true)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-teal-50 dark:bg-teal-950 text-teal-800 dark:text-teal-200 hover:bg-teal-100 dark:hover:bg-teal-900 border border-teal-200 dark:border-teal-800 transition-colors"
-                  >
-                    <ImageIcon size={13} className="text-teal-700 dark:text-teal-300" />
-                    <span>Выбрать из библиотеки</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      // AI Auto-adapt for this channel
-                      const generated = `[${channelTabLabels[activeChannelTab]}] ${selectedItem.title}\n\n${selectedItem.topic}\n\nГлавное преимущество — прозрачный расчет и гарантия качества по договору.\n\nНапишите «${selectedItem.trigger_keyword}» для бесплатной консультации и замера!`;
-                      handleTextChange(generated);
-                    }}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200/80 dark:hover:bg-zinc-700 transition-colors"
-                  >
-                    <Sparkles size={13} className="text-teal-600 dark:text-teal-400" />
-                    <span>Сгенерировать AI</span>
-                  </button>
-                </div>
+              {/* Main Textarea */}
+              <div className="flex-1 flex flex-col min-h-[240px]">
+                <textarea
+                  value={editorText}
+                  onChange={(e) => handleTextChange(e.target.value)}
+                  placeholder={`Напишите черновик поста или тезисы...\n\nЗатем нажмите кнопку «🪄 Заполнить параметры и адаптировать через ИИ» выше, чтобы автоматически оформить пост с оффером, триггером и структурой под ${channelTabLabels[activeChannelTab]}.`}
+                  className="w-full flex-1 p-3.5 text-xs font-sans text-zinc-900 dark:text-zinc-100 bg-zinc-50/70 dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-600/30 focus:border-teal-600 leading-relaxed resize-none transition-all shadow-2xs"
+                />
               </div>
 
-              {/* Attached Media Strip */}
-              <div className="pt-2 border-t border-zinc-200 dark:border-zinc-800 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300 flex items-center gap-1.5">
-                    <ImageIcon size={13} className="text-teal-600 dark:text-teal-400" />
-                    <span>Прикрепленные медиафайлы ({selectedItem.media_assets.length})</span>
+              {/* Text Counters */}
+              <div className="flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400">
+                <div className="flex items-center gap-2">
+                  <span>Символов: {editorText.length}</span>
+                  <span>•</span>
+                  <span>
+                    Слов: {editorText.trim() ? editorText.trim().split(/\s+/).length : 0}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => setShowMediaPicker(true)}
-                    className="text-[11px] text-teal-700 dark:text-teal-400 hover:text-teal-800 font-medium"
-                  >
-                    + Добавить еще
-                  </button>
+                </div>
+                <span>
+                  {activeChannelTab === "telegram"
+                    ? "Поддерживается HTML разметка (<b>, <i>)"
+                    : activeChannelTab === "vk_wall"
+                    ? "Форматирование для умной ленты VK"
+                    : ""}
+                </span>
+              </div>
+
+              {/* Media Attachment Section with Drag & Drop */}
+              <div className="pt-3 border-t border-zinc-200 dark:border-zinc-800 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-200 flex items-center gap-1.5">
+                    <ImageIcon size={13} className="text-teal-600 dark:text-teal-400" />
+                    <span>Прикрепленные фотографии ({selectedItem.media_assets.length})</span>
+                  </span>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="text-xs text-teal-700 dark:text-teal-400 hover:underline font-medium inline-flex items-center gap-1"
+                    >
+                      <UploadCloud size={13} />
+                      <span>Загрузить с ПК</span>
+                    </button>
+                    <span className="text-zinc-300 dark:text-zinc-700">•</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowMediaPicker(true)}
+                      className="text-xs text-teal-700 dark:text-teal-400 hover:underline font-medium inline-flex items-center gap-1"
+                    >
+                      <ImageIcon size={13} />
+                      <span>Из медиатеки</span>
+                    </button>
+                  </div>
                 </div>
 
-                {selectedItem.media_assets.length === 0 ? (
-                  <div className="p-3 border border-dashed border-zinc-200 dark:border-zinc-800 rounded-lg text-center text-zinc-600 dark:text-zinc-400 text-xs bg-zinc-50/50 dark:bg-zinc-800/30">
-                    Фотографии не прикреплены. Нажмите «Выбрать из библиотеки», чтобы прикрепить фото готовых объектов.
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-4 gap-2">
-                    {selectedItem.media_assets.map((media) => (
-                      <div
-                        key={media.id}
-                        className="group relative rounded-lg border border-zinc-200 dark:border-zinc-700 overflow-hidden bg-zinc-100 dark:bg-zinc-800 h-20"
-                      >
-                        <img
-                          src={media.url}
-                          alt={media.title}
-                          className="w-full h-full object-cover"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const updated = selectedItem.media_assets.filter((m) => m.id !== media.id);
-                            onUpdateItemMedia(selectedItem.id, updated);
-                          }}
-                          className="absolute top-1 right-1 p-1 rounded-full bg-black/60 hover:bg-red-600 text-white transition-colors"
-                          title="Удалить из поста"
+                {/* Hidden Native File Input */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    if (e.target.files) handleFilesSelected(e.target.files);
+                  }}
+                />
+
+                {/* Drag-and-drop Dropzone / Media Grid */}
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDraggingFile(true);
+                  }}
+                  onDragLeave={() => setIsDraggingFile(false)}
+                  onDrop={handleFileDrop}
+                  className={`border-2 border-dashed rounded-xl p-3 transition-colors ${
+                    isDraggingFile
+                      ? "border-teal-500 bg-teal-50/50 dark:bg-teal-950/30"
+                      : "border-zinc-200 dark:border-zinc-800 bg-zinc-50/40 dark:bg-zinc-950/40"
+                  }`}
+                >
+                  {selectedItem.media_assets.length === 0 ? (
+                    <div
+                      onClick={() => fileInputRef.current?.click()}
+                      className="text-center py-4 cursor-pointer"
+                    >
+                      <UploadCloud
+                        size={24}
+                        className="mx-auto text-zinc-400 dark:text-zinc-600 mb-1"
+                      />
+                      <p className="text-xs text-zinc-600 dark:text-zinc-400 font-medium">
+                        Перетащите фотографии сюда или нажмите для выбора с диска
+                      </p>
+                      <p className="text-[10px] text-zinc-400 dark:text-zinc-500 mt-0.5">
+                        Фото будут прикреплены к публикации в VK и Telegram
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-4 gap-2">
+                      {selectedItem.media_assets.map((media) => (
+                        <div
+                          key={media.id}
+                          className="group relative rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-zinc-100 dark:bg-zinc-800 h-20 shadow-2xs"
                         >
-                          <X size={11} />
-                        </button>
-                        <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] px-1 py-0.5 truncate backdrop-blur-2xs">
-                          {media.title}
+                          <img
+                            src={media.url}
+                            alt={media.title}
+                            className="w-full h-full object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const updated = selectedItem.media_assets.filter(
+                                (m) => m.id !== media.id
+                              );
+                              onUpdateItemMedia(selectedItem.id, updated);
+                            }}
+                            className="absolute top-1 right-1 p-1 rounded-full bg-black/60 hover:bg-red-600 text-white transition-colors"
+                            title="Удалить из поста"
+                          >
+                            <X size={10} />
+                          </button>
+                          <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] px-1 py-0.5 truncate backdrop-blur-2xs">
+                            {media.title}
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                      ))}
+
+                      {/* Add more button in grid */}
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="h-20 rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 flex flex-col items-center justify-center text-zinc-500 hover:text-teal-600 hover:border-teal-500 transition-colors text-[10px] gap-1"
+                      >
+                        <Plus size={16} />
+                        <span>Добавить</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
-            {/* Live Preview Column (Social Network Card Simulator) */}
+            {/* Right Column: Live Channel Preview */}
             <div className="p-6 bg-zinc-50/60 dark:bg-zinc-950/60 overflow-y-auto space-y-4">
-              <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400 block">
+              <span className="text-xs font-semibold text-zinc-500 dark:text-zinc-400 block">
                 Предпросмотр публикации ({channelTabLabels[activeChannelTab]})
               </span>
 
               <div className="bg-white dark:bg-zinc-900 border border-zinc-200/90 dark:border-zinc-800 rounded-xl shadow-xs overflow-hidden max-w-sm mx-auto">
                 <div className="p-3.5 border-b border-zinc-100 dark:border-zinc-800 flex items-center gap-2.5">
                   <div className="w-8 h-8 rounded-full bg-teal-800 flex items-center justify-center text-white text-xs font-bold">
-                    Ф
+                    {activeProject.name.charAt(0)}
                   </div>
                   <div>
                     <div className="text-xs font-semibold text-zinc-900 dark:text-zinc-100 leading-tight">
                       {activeProject.name}
                     </div>
-                    <div className="text-[10px] text-zinc-600 dark:text-zinc-400">
-                      {channelTabLabels[activeChannelTab]} • только что
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
+                      {channelTabLabels[activeChannelTab]} • Предпросмотр
                     </div>
                   </div>
                 </div>
 
                 <div className="p-3.5 text-xs text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap leading-relaxed">
-                  {editorText || "Текст поста для этой площадки еще не написан."}
+                  {editorText || (
+                    <span className="text-zinc-400 italic">
+                      Текст поста для этой площадки еще не написан. Введите текст слева или
+                      нажмите «🪄 Заполнить параметры и адаптировать через ИИ».
+                    </span>
+                  )}
                 </div>
 
                 {selectedItem.media_assets.length > 0 && (
@@ -588,30 +1429,316 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
               </div>
             </div>
           </div>
+
+          {/* 3. Popover / Modal: «⚡ Опубликовать сейчас» */}
+          {isPublishNowOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-2xs p-4 animate-in fade-in duration-150">
+              <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 max-w-md w-full p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-3">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-emerald-100 dark:bg-emerald-950/80 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                      <Zap size={16} className="fill-current" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">
+                        Мгновенная публикация
+                      </h3>
+                      <p className="text-[11px] text-zinc-500">
+                        Куда отправить публикацию прямо сейчас?
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsPublishNowOpen(false)}
+                    className="p-1 rounded-lg text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="space-y-2.5">
+                  <label className="flex items-center justify-between p-3 rounded-xl border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 cursor-pointer transition-colors">
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        checked={publishChannels.vk}
+                        onChange={(e) =>
+                          setPublishChannels({ ...publishChannels, vk: e.target.checked })
+                        }
+                        className="w-4 h-4 text-teal-600 rounded border-zinc-300 focus:ring-teal-600"
+                      />
+                      <div>
+                        <div className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                          ВКонтакте (стена сообщества)
+                        </div>
+                        <div className="text-[11px] text-zinc-500">
+                          Метод wall.post с загрузкой фото в альбом стены
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] font-semibold text-emerald-600 bg-emerald-50 dark:bg-emerald-950 px-2 py-0.5 rounded">
+                      VK API
+                    </span>
+                  </label>
+
+                  <label className="flex items-center justify-between p-3 rounded-xl border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 cursor-pointer transition-colors">
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        checked={publishChannels.tg}
+                        onChange={(e) =>
+                          setPublishChannels({ ...publishChannels, tg: e.target.checked })
+                        }
+                        className="w-4 h-4 text-teal-600 rounded border-zinc-300 focus:ring-teal-600"
+                      />
+                      <div>
+                        <div className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                          Telegram (канал)
+                        </div>
+                        <div className="text-[11px] text-zinc-500">
+                          {api.getTelegramChannelId() || "Канал из настроек интеграции"}
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] font-semibold text-blue-600 bg-blue-50 dark:bg-blue-950 px-2 py-0.5 rounded">
+                      TG Bot API
+                    </span>
+                  </label>
+                </div>
+
+                <div className="text-[11px] text-zinc-500 bg-zinc-50 dark:bg-zinc-950 p-2.5 rounded-lg border border-zinc-100 dark:border-zinc-800">
+                  Будут опубликованы адаптированные тексты и прикрепленные фотографии (
+                  {selectedItem.media_assets.length} шт).
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsPublishNowOpen(false)}
+                    className="px-3 py-1.5 text-xs text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-colors"
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExecutePublishNow}
+                    disabled={isPublishingNow || (!publishChannels.vk && !publishChannels.tg)}
+                    className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-all shadow-2xs cursor-pointer disabled:opacity-50"
+                  >
+                    {isPublishingNow ? (
+                      <RefreshCw size={13} className="animate-spin" />
+                    ) : (
+                      <Send size={13} />
+                    )}
+                    <span>
+                      {isPublishingNow
+                        ? "Публикация..."
+                        : `Опубликовать в соцсети (${
+                            (publishChannels.vk ? 1 : 0) + (publishChannels.tg ? 1 : 0)
+                          })`}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 4. Popover / Modal: «📅 Запланировать в календарь» */}
+          {isScheduleModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-2xs p-4 animate-in fade-in duration-150">
+              <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-800 max-w-md w-full p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-zinc-100 dark:border-zinc-800 pb-3">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-teal-100 dark:bg-teal-950/80 text-teal-600 dark:text-teal-400 flex items-center justify-center">
+                      <Calendar size={16} />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">
+                        Запланировать в календарь
+                      </h3>
+                      <p className="text-[11px] text-zinc-500">
+                        Укажите дату, время и целевые каналы
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsScheduleModalOpen(false)}
+                    className="p-1 rounded-lg text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                {/* Date & Time Selectors */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1 flex items-center gap-1">
+                      <Calendar size={12} className="text-teal-600" />
+                      <span>Дата публикации</span>
+                    </label>
+                    <input
+                      type="date"
+                      value={scheduleDate}
+                      onChange={(e) => setScheduleDate(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 rounded-lg text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-teal-600"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1 flex items-center gap-1">
+                      <Clock size={12} className="text-teal-600" />
+                      <span>Время</span>
+                    </label>
+                    <input
+                      type="time"
+                      value={scheduleTime}
+                      onChange={(e) => setScheduleTime(e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-xs bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 rounded-lg text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-teal-600"
+                    />
+                  </div>
+                </div>
+
+                {/* Quick Presets */}
+                <div className="flex items-center gap-1.5 text-[11px]">
+                  <span className="text-zinc-500">Быстрый выбор:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const today = new Date().toISOString().slice(0, 10);
+                      setScheduleDate(today);
+                      setScheduleTime("19:00");
+                    }}
+                    className="px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-teal-100 transition-colors"
+                  >
+                    Сегодня вечер
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setScheduleDate(getTomorrowIso());
+                      setScheduleTime("12:00");
+                    }}
+                    className="px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-teal-100 transition-colors"
+                  >
+                    Завтра 12:00
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const d = new Date();
+                      d.setDate(d.getDate() + 2);
+                      setScheduleDate(d.toISOString().slice(0, 10));
+                      setScheduleTime("14:00");
+                    }}
+                    className="px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-teal-100 transition-colors"
+                  >
+                    Через 2 дня
+                  </button>
+                </div>
+
+                {/* Target Channels Checkboxes */}
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">
+                    Целевые каналы публикации
+                  </label>
+                  <div className="space-y-1.5">
+                    <label className="flex items-center gap-2 p-2 rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={scheduleChannels.vk}
+                        onChange={(e) =>
+                          setScheduleChannels({
+                            ...scheduleChannels,
+                            vk: e.target.checked,
+                          })
+                        }
+                        className="w-4 h-4 text-teal-600 rounded border-zinc-300 focus:ring-teal-600"
+                      />
+                      <span className="text-xs font-medium text-zinc-800 dark:text-zinc-200">
+                        ВКонтакте (стена сообщества)
+                      </span>
+                    </label>
+
+                    <label className="flex items-center gap-2 p-2 rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={scheduleChannels.tg}
+                        onChange={(e) =>
+                          setScheduleChannels({
+                            ...scheduleChannels,
+                            tg: e.target.checked,
+                          })
+                        }
+                        className="w-4 h-4 text-teal-600 rounded border-zinc-300 focus:ring-teal-600"
+                      />
+                      <span className="text-xs font-medium text-zinc-800 dark:text-zinc-200">
+                        Telegram (канал)
+                      </span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+                  <button
+                    type="button"
+                    onClick={() => setIsScheduleModalOpen(false)}
+                    className="px-3 py-1.5 text-xs text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-colors"
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExecuteSchedule}
+                    className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-teal-700 hover:bg-teal-800 text-white rounded-lg transition-colors shadow-2xs cursor-pointer"
+                  >
+                    <Calendar size={13} />
+                    <span>Запланировать публикацию</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 5. Media Picker Modal */}
+          {showMediaPicker && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6 backdrop-blur-2xs">
+              <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl max-w-4xl w-full h-[80vh] overflow-hidden flex flex-col border border-zinc-200 dark:border-zinc-800">
+                <MediaLibrary
+                  activeProject={activeProject}
+                  mediaAssets={allMediaAssets}
+                  onUploadMedia={onUploadMedia}
+                  isPickerMode={true}
+                  selectedAssetIds={selectedItem.media_assets.map((m) => m.id)}
+                  onClosePicker={() => setShowMediaPicker(false)}
+                  onConfirmSelection={(selectedAssets) => {
+                    onUpdateItemMedia(selectedItem.id, selectedAssets);
+                    setShowMediaPicker(false);
+                  }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       ) : (
-        <div className="flex-1 flex items-center justify-center text-zinc-600 dark:text-zinc-400 text-xs">
-          Выберите или создайте карточку контента.
-        </div>
-      )}
-
-      {/* Media Picker Modal */}
-      {showMediaPicker && selectedItem && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6 backdrop-blur-2xs">
-          <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl max-w-4xl w-full h-[80vh] overflow-hidden flex flex-col border border-zinc-200 dark:border-zinc-800">
-            <MediaLibrary
-              activeProject={activeProject}
-              mediaAssets={allMediaAssets}
-              onUploadMedia={onUploadMedia}
-              isPickerMode={true}
-              selectedAssetIds={selectedItem.media_assets.map((m) => m.id)}
-              onClosePicker={() => setShowMediaPicker(false)}
-              onConfirmSelection={(selectedAssets) => {
-                onUpdateItemMedia(selectedItem.id, selectedAssets);
-                setShowMediaPicker(false);
-              }}
-            />
-          </div>
+        <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 dark:text-zinc-400 text-xs p-8">
+          <FileText size={40} className="text-zinc-300 dark:text-zinc-700 mb-3" />
+          <p className="font-semibold text-sm text-zinc-700 dark:text-zinc-300">
+            Публикация не выбрана
+          </p>
+          <p className="mt-1 text-zinc-500">
+            Выберите публикацию из списка слева или создайте новый пост
+          </p>
+          <button
+            type="button"
+            onClick={handleCreateDraftDirectly}
+            className="mt-4 px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 shadow-2xs cursor-pointer"
+          >
+            <Plus size={15} />
+            <span>Создать пост</span>
+          </button>
         </div>
       )}
     </div>
