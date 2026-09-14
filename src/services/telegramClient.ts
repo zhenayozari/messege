@@ -318,6 +318,29 @@ export async function sendTelegramMessageDirect(
 const mediaBlobCache = new Map<string, string>();
 
 /**
+ * Получение пути к локальному прокси бэкенда для обхода блокировок и ERR_CONNECTION_TIMED_OUT
+ */
+export function getProxyMediaUrl(url: string): string {
+  if (!url) return "";
+  if (url.startsWith("/api/media/file") || url.startsWith("blob:")) return url;
+  return `/api/media/file?url=${encodeURIComponent(url)}`;
+}
+
+/**
+ * Очистка кеша медиа-блобов
+ */
+export function clearTelegramMediaCache(): void {
+  mediaBlobCache.forEach((url) => {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      //
+    }
+  });
+  mediaBlobCache.clear();
+}
+
+/**
  * Получение информации о файле (file_path и прямая ссылка) через метод getFile
  */
 export async function getTelegramFileInfo(
@@ -353,20 +376,22 @@ export async function getTelegramFileDirectUrl(fileId: string): Promise<string |
 
 /**
  * Надежная загрузка медиа через Blob:
- * - Делает fetch к https://api.telegram.org/file/bot<TOKEN>/<filePath> (или полному URL)
- * - Получает бинарный response.blob() с корректным MIME-типом (image/jpeg, audio/ogg, video/mp4, application/pdf и др.)
+ * - Делает fetch к https://api.telegram.org/file/bot<TOKEN>/<filePath> (или полному URL) с таймаутом
+ * - При ошибке сети (ERR_CONNECTION_TIMED_OUT) или блокировке автоматически переключается на локальный прокси бэкенда (/api/media/file?url=...)
+ * - Получает бинарный response.blob() с корректным MIME-типом (image/jpeg, video/mp4, audio/ogg, application/pdf и др.)
  * - Создает локальный URL через URL.createObjectURL(blob)
- * - Кеширует этот blob-URL в памяти, чтобы не скачивать файл заново при каждом рендере
+ * - Кеширует этот blob-URL в памяти
  */
 export async function downloadTelegramMediaBlob(
   filePath: string,
-  mediaType?: Message["media_type"] | string
+  mediaType?: Message["media_type"] | string,
+  forceRefresh: boolean = false
 ): Promise<string | null> {
   if (!filePath) return null;
   if (filePath.startsWith("blob:")) return filePath;
 
   const cacheKey = filePath.trim();
-  if (mediaBlobCache.has(cacheKey)) {
+  if (!forceRefresh && mediaBlobCache.has(cacheKey)) {
     return mediaBlobCache.get(cacheKey)!;
   }
 
@@ -382,36 +407,91 @@ export async function downloadTelegramMediaBlob(
     fetchUrl = `https://api.telegram.org/file/bot${token}/${cleanPath}`;
   }
 
+  let rawBlob: Blob | null = null;
+
+  // 1. Попытка прямой загрузки с таймаутом (7 секунд)
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+
     const res = await fetch(fetchUrl, {
       referrerPolicy: "no-referrer",
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
-    if (!res.ok) {
-      console.warn(`Telegram media fetch failed (${res.status} ${res.statusText}): ${fetchUrl}`);
-      return null;
+    if (res.ok) {
+      rawBlob = await res.blob();
+    } else {
+      console.warn(`Direct Telegram media fetch returned status ${res.status}: ${fetchUrl}`);
     }
+  } catch (directErr: any) {
+    console.warn("Direct Telegram media fetch failed (timeout/CORS/network):", directErr?.message || directErr);
+  }
 
-    const rawBlob = await res.blob();
+  // 2. Fallback: Загрузка через локальный бэкенд-прокси /api/media/file?url=...
+  if (!rawBlob && typeof window !== "undefined") {
+    try {
+      const proxyUrl = getProxyMediaUrl(fetchUrl);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
 
-    // Определение точного MIME-типа для обхода ограничений браузеров
+      const proxyRes = await fetch(proxyUrl, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (proxyRes.ok) {
+        rawBlob = await proxyRes.blob();
+      } else {
+        console.warn(`Backend proxy media fetch failed with status ${proxyRes.status}`);
+      }
+    } catch (proxyErr: any) {
+      console.warn("Backend proxy media fetch failed:", proxyErr?.message || proxyErr);
+    }
+  }
+
+  if (!rawBlob) {
+    return null;
+  }
+
+  try {
+    // Определение точного MIME-типа для видео, фото, аудио и документов
     let targetMimeType = rawBlob.type;
     const lowerPath = filePath.toLowerCase();
 
-    if (mediaType === "photo" || lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) {
+    // Видео форматы (.mp4, .mov, .webm, video, video_note, animation)
+    if (
+      mediaType === "video" ||
+      mediaType === "video_note" ||
+      mediaType === "animation" ||
+      lowerPath.endsWith(".mp4") ||
+      lowerPath.endsWith(".m4v")
+    ) {
+      targetMimeType = "video/mp4";
+    } else if (lowerPath.endsWith(".webm")) {
+      targetMimeType = "video/webm";
+    } else if (lowerPath.endsWith(".mov")) {
+      targetMimeType = "video/quicktime";
+    }
+    // Фото форматы (.jpg, .jpeg, .png, .webp, .gif)
+    else if (mediaType === "photo" || lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) {
       targetMimeType = "image/jpeg";
     } else if (lowerPath.endsWith(".png")) {
       targetMimeType = "image/png";
     } else if (lowerPath.endsWith(".webp")) {
       targetMimeType = "image/webp";
-    } else if (mediaType === "voice" || lowerPath.endsWith(".oga") || lowerPath.endsWith(".ogg")) {
-      // Telegram voice (.oga / Ogg Opus) для гарантированного воспроизведения в HTML5 <audio>
+    } else if (lowerPath.endsWith(".gif")) {
+      targetMimeType = "image/gif";
+    }
+    // Голосовые и аудио форматы (.oga, .ogg, .mp3, voice)
+    else if (mediaType === "voice" || lowerPath.endsWith(".oga") || lowerPath.endsWith(".ogg")) {
       targetMimeType = "audio/ogg";
     } else if (lowerPath.endsWith(".mp3")) {
       targetMimeType = "audio/mp3";
-    } else if (mediaType === "video_note" || mediaType === "video" || lowerPath.endsWith(".mp4")) {
-      targetMimeType = "video/mp4";
-    } else if (lowerPath.endsWith(".pdf") || (mediaType === "document" && lowerPath.includes(".pdf"))) {
+    }
+    // Документы
+    else if (lowerPath.endsWith(".pdf") || (mediaType === "document" && lowerPath.includes(".pdf"))) {
       targetMimeType = "application/pdf";
     } else if (lowerPath.endsWith(".doc") || lowerPath.endsWith(".docx")) {
       targetMimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -424,7 +504,7 @@ export async function downloadTelegramMediaBlob(
     if (!targetMimeType || targetMimeType === "application/octet-stream") {
       if (mediaType === "photo") targetMimeType = "image/jpeg";
       else if (mediaType === "voice") targetMimeType = "audio/ogg";
-      else if (mediaType === "video_note" || mediaType === "video") targetMimeType = "video/mp4";
+      else if (mediaType === "video_note" || mediaType === "video" || mediaType === "animation") targetMimeType = "video/mp4";
       else if (mediaType === "document") targetMimeType = "application/octet-stream";
     }
 
@@ -440,7 +520,7 @@ export async function downloadTelegramMediaBlob(
 
     return blobUrl;
   } catch (err) {
-    console.warn("downloadTelegramMediaBlob error:", err);
+    console.warn("downloadTelegramMediaBlob processing error:", err);
     return null;
   }
 }

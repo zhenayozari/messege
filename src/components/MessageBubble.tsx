@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   Bot,
   Camera,
   Check,
@@ -11,19 +12,19 @@ import {
   File,
   FileSpreadsheet,
   FileText,
+  Film,
   Lock,
+  Maximize2,
   Mic,
   Pause,
   Play,
   RefreshCw,
-  Send,
   User,
   Video,
-  Volume2,
   X,
 } from "lucide-react";
 import { Message } from "../types";
-import { downloadTelegramMediaBlob } from "../services/telegramClient";
+import { downloadTelegramMediaBlob, getProxyMediaUrl } from "../services/telegramClient";
 
 interface MessageBubbleProps {
   message: Message;
@@ -45,33 +46,160 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     message.blob_url || (message.media_url?.startsWith("blob:") ? message.media_url : null)
   );
   const [isLoadingBlob, setIsLoadingBlob] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [imageError, setImageError] = useState(false);
-  const [isDownloadingDoc, setIsDownloadingDoc] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
 
-  // Automatically fetch Blob for inbound Telegram media if not already cached
+  // Modals for fullscreen preview
+  const [isVideoModalOpen, setIsVideoModalOpen] = useState(false);
+  const [isPhotoModalOpen, setIsPhotoModalOpen] = useState(false);
+
+  // Handle ESC key for modal closing
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsVideoModalOpen(false);
+        setIsPhotoModalOpen(false);
+      }
+    };
+    if (isVideoModalOpen || isPhotoModalOpen) {
+      window.addEventListener("keydown", handleKeyDown);
+    }
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isVideoModalOpen, isPhotoModalOpen]);
+
+  // 1. SMART MEDIA TYPE DETECTION
+  const rawFileName =
+    message.file_name || (message.attachments && message.attachments[0]?.title) || "";
+  const rawSource =
+    message.media_url ||
+    message.file_path ||
+    (message.attachments && message.attachments[0]?.url) ||
+    "";
+  const lowerFileName = rawFileName.toLowerCase();
+  const lowerSource = rawSource.toLowerCase();
+  const rawMediaType = message.media_type;
+
+  // Video extension check (.mp4, .mov, .webm, etc.)
+  const isVideoExt =
+    lowerFileName.endsWith(".mp4") ||
+    lowerFileName.endsWith(".mov") ||
+    lowerFileName.endsWith(".webm") ||
+    lowerFileName.endsWith(".m4v") ||
+    lowerFileName.endsWith(".mkv") ||
+    lowerSource.includes(".mp4") ||
+    lowerSource.includes(".mov") ||
+    lowerSource.includes(".webm");
+
+  const isVideo =
+    rawMediaType === "video" ||
+    rawMediaType === "animation" ||
+    isVideoExt ||
+    Boolean(message.attachments && message.attachments.some((a) => a.type === "video"));
+
+  const isVideoNote = rawMediaType === "video_note";
+
+  // Photo extension check (.jpg, .png, .webp, etc.)
+  const isPhotoExt =
+    lowerFileName.endsWith(".jpg") ||
+    lowerFileName.endsWith(".jpeg") ||
+    lowerFileName.endsWith(".png") ||
+    lowerFileName.endsWith(".webp") ||
+    lowerFileName.endsWith(".gif") ||
+    lowerFileName.endsWith(".bmp") ||
+    lowerSource.includes(".jpg") ||
+    lowerSource.includes(".jpeg") ||
+    lowerSource.includes(".png") ||
+    lowerSource.includes(".webp");
+
+  const isPhoto =
+    !isVideo &&
+    !isVideoNote &&
+    (rawMediaType === "photo" ||
+      isPhotoExt ||
+      Boolean(message.attachments && message.attachments.some((a) => a.type === "photo")));
+
+  const isVoice =
+    !isVideo &&
+    !isVideoNote &&
+    !isPhoto &&
+    (rawMediaType === "voice" ||
+      lowerFileName.endsWith(".oga") ||
+      lowerFileName.endsWith(".ogg"));
+
+  const isDoc =
+    !isVideo &&
+    !isVideoNote &&
+    !isPhoto &&
+    !isVoice &&
+    (rawMediaType === "document" ||
+      Boolean(
+        message.attachments &&
+          message.attachments.some((a) => a.type === "doc" || a.type === "document")
+      ));
+
+  // Resolved active media URL (prefers cached Blob URL, falls back to direct URL or proxy)
+  const activeMediaUrl =
+    blobUrl ||
+    message.media_url ||
+    (message.attachments && message.attachments[0]?.url) ||
+    null;
+
+  const resolvedFileName =
+    rawFileName ||
+    (isPhoto ? "photo.jpg" : isVideo ? "video.mp4" : isDoc ? "document.pdf" : "file");
+
+  const messageText = message.caption || message.text;
+
+  // 2. AUTOMATIC FETCH OF TELEGRAM MEDIA BLOB (with proxy fallback and timeout)
   useEffect(() => {
     let isMounted = true;
     if (message.blob_url) {
       setBlobUrl(message.blob_url);
+      setLoadError(false);
       return;
     }
     if (message.media_url?.startsWith("blob:")) {
       setBlobUrl(message.media_url);
+      setLoadError(false);
       return;
     }
 
     const source = message.file_path || message.media_url;
     if (!source) return;
 
+    // Only fetch if it looks like a Telegram URL or internal path
+    const isTelegramSource =
+      source.includes("api.telegram.org") ||
+      source.startsWith("documents/") ||
+      source.startsWith("photos/") ||
+      source.startsWith("voice/") ||
+      source.startsWith("video/") ||
+      source.startsWith("video_notes/");
+
+    if (!isTelegramSource && !isVideo && !isPhoto) return;
+
     setIsLoadingBlob(true);
-    downloadTelegramMediaBlob(source, message.media_type || undefined)
+    setLoadError(false);
+
+    const detectedType = isVideo ? "video" : isPhoto ? "photo" : isVoice ? "voice" : message.media_type;
+
+    downloadTelegramMediaBlob(source, detectedType || undefined)
       .then((bUrl) => {
-        if (isMounted && bUrl) {
-          setBlobUrl(bUrl);
+        if (isMounted) {
+          if (bUrl) {
+            setBlobUrl(bUrl);
+            setLoadError(false);
+          } else {
+            // Direct fetch and proxy both failed
+            setLoadError(true);
+          }
         }
       })
       .catch((err) => {
-        console.warn("downloadTelegramMediaBlob error in MessageBubble:", err);
+        console.warn("Media fetch error in MessageBubble:", err);
+        if (isMounted) setLoadError(true);
       })
       .finally(() => {
         if (isMounted) setIsLoadingBlob(false);
@@ -80,12 +208,73 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [message.blob_url, message.file_path, message.media_url, message.media_type]);
+  }, [message.blob_url, message.file_path, message.media_url, message.media_type, isVideo, isPhoto, isVoice]);
+
+  // Retry loading media from Telegram / local proxy
+  const handleRetryLoad = async () => {
+    const source = message.file_path || message.media_url;
+    if (!source) return;
+
+    setIsRetrying(true);
+    setLoadError(false);
+    setImageError(false);
+
+    const detectedType = isVideo ? "video" : isPhoto ? "photo" : isVoice ? "voice" : message.media_type;
+
+    try {
+      const bUrl = await downloadTelegramMediaBlob(source, detectedType || undefined, true);
+      if (bUrl) {
+        setBlobUrl(bUrl);
+        setLoadError(false);
+      } else {
+        setLoadError(true);
+      }
+    } catch {
+      setLoadError(true);
+    } finally {
+      setIsRetrying(false);
+    }
+  };
+
+  // Safe file download handler
+  const handleDownloadMedia = async (e: React.MouseEvent) => {
+    if (blobUrl) {
+      // Standard <a> download attribute works directly for blob URLs
+      return;
+    }
+    const source = message.file_path || message.media_url;
+    if (!source) return;
+
+    e.preventDefault();
+    setIsDownloading(true);
+
+    const detectedType = isVideo ? "video" : isPhoto ? "photo" : isVoice ? "voice" : "document";
+
+    try {
+      const downloaded = await downloadTelegramMediaBlob(source, detectedType);
+      if (downloaded) {
+        setBlobUrl(downloaded);
+        const link = document.createElement("a");
+        link.href = downloaded;
+        link.download = resolvedFileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else if (activeMediaUrl) {
+        window.open(activeMediaUrl, "_blank");
+      }
+    } catch (err) {
+      console.warn("Download error:", err);
+      if (activeMediaUrl) window.open(activeMediaUrl, "_blank");
+    } finally {
+      setIsDownloading(false);
+    }
+  };
 
   // Voice player state
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [playProgress, setPlayProgress] = useState(0); // 0 to 100%
+  const [playProgress, setPlayProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState<1 | 1.5 | 2>(1);
   const durationSec = message.duration_sec || 24;
 
@@ -99,7 +288,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     const hasRealAudio = Boolean(blobUrl || message.media_url);
     if (isPlaying && !hasRealAudio) {
       const stepMs = 100;
-      const totalSteps = ((durationSec * 1000) / playbackSpeed) / stepMs;
+      const totalSteps = (durationSec * 1000) / playbackSpeed / stepMs;
       interval = setInterval(() => {
         setPlayProgress((prev) => {
           if (prev >= 100) {
@@ -129,11 +318,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         audioRef.current.playbackRate = playbackSpeed;
         audioRef.current
           .play()
-          .then(() => {
-            setIsPlaying(true);
-          })
+          .then(() => setIsPlaying(true))
           .catch((err) => {
-            console.warn("Audio element play error, falling back:", err);
+            console.warn("Audio play error, falling back:", err);
             setIsPlaying(true);
           });
       }
@@ -144,20 +331,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         if (playProgress >= 98) setPlayProgress(0);
         setIsPlaying(true);
       }
-    }
-  };
-
-  const toggleVideoPlay = () => {
-    if (videoRef.current) {
-      if (isVideoPlaying) {
-        videoRef.current.pause();
-        setIsVideoPlaying(false);
-      } else {
-        videoRef.current.play().catch(() => {});
-        setIsVideoPlaying(true);
-      }
-    } else {
-      setIsVideoPlaying(!isVideoPlaying);
     }
   };
 
@@ -177,7 +350,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
   const currentSec = Math.round((playProgress / 100) * durationSec);
 
-  // Format file size
   const formatFileSize = (bytes?: number | null) => {
     if (!bytes) return "1.4 МБ";
     if (bytes < 1024) return `${bytes} Б`;
@@ -185,7 +357,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
   };
 
-  // Document icon helper
   const getDocumentIcon = (fileName?: string | null) => {
     const lower = (fileName || "").toLowerCase();
     if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".csv")) {
@@ -195,6 +366,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
       return <FileText size={22} className="text-teal-600 dark:text-teal-400 shrink-0" />;
     }
     return <File size={22} className="text-blue-500 shrink-0" />;
+  };
+
+  // Open photo lightbox
+  const handleOpenPhoto = () => {
+    if (onPreviewImage && activeMediaUrl) {
+      onPreviewImage(activeMediaUrl, messageText || "Фотография от клиента");
+    }
+    setIsPhotoModalOpen(true);
   };
 
   // 1. SPECIAL RENDERING: INTERNAL TEAM NOTE
@@ -223,79 +402,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     );
   }
 
-  // 2. STANDARD INBOUND / OUTBOUND MESSAGE WITH RICH MEDIA
-  const mediaType = message.media_type;
-  const hasPhoto =
-    mediaType === "photo" ||
-    (!mediaType && message.attachments && message.attachments.some((a) => a.type === "photo"));
-  const rawPhotoUrl =
-    message.media_url ||
-    (message.attachments && message.attachments.find((a) => a.type === "photo")?.url);
-  const photoUrl = blobUrl || rawPhotoUrl;
-
-  const isVoice = mediaType === "voice";
-  const activeAudioUrl = blobUrl || message.media_url;
-
-  const isVideoNote = mediaType === "video_note";
-  const isVideo = mediaType === "video";
-  const activeVideoUrl = blobUrl || message.media_url;
-
-  const isDoc =
-    mediaType === "document" ||
-    (!mediaType &&
-      message.attachments &&
-      message.attachments.some((a) => a.type === "doc" || a.type === "document"));
-  const docUrl =
-    message.media_url ||
-    (message.attachments &&
-      message.attachments.find((a) => a.type === "doc" || a.type === "document")?.url);
-  const activeDocUrl = blobUrl || docUrl;
-  const docName =
-    message.file_name ||
-    (message.attachments && message.attachments.find((a) => a.type === "doc")?.title) ||
-    "Документ_вложение.pdf";
-
-  const messageText = message.caption || message.text;
-
-  // Safe download document handler without CORS errors
-  const handleDownloadDocument = async (e: React.MouseEvent) => {
-    if (blobUrl) {
-      // Direct download of blob url works with browser download attribute
-      return;
-    }
-    const source = message.file_path || message.media_url;
-    if (!source) return;
-
-    e.preventDefault();
-    setIsDownloadingDoc(true);
-    try {
-      const downloaded = await downloadTelegramMediaBlob(source, "document");
-      if (downloaded) {
-        setBlobUrl(downloaded);
-        const link = document.createElement("a");
-        link.href = downloaded;
-        link.download = docName;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-      } else if (docUrl) {
-        window.open(docUrl, "_blank");
-      }
-    } catch (err) {
-      console.warn("Failed to download document blob:", err);
-      if (docUrl) window.open(docUrl, "_blank");
-    } finally {
-      setIsDownloadingDoc(false);
-    }
-  };
-
+  // 2. STANDARD INBOUND / OUTBOUND MESSAGE
   return (
     <div className={`flex flex-col ${isInbound ? "items-start" : "items-end"} w-full`}>
       {/* Hidden audio element for voice notes with actual URLs */}
-      {isVoice && activeAudioUrl && (
+      {isVoice && activeMediaUrl && (
         <audio
           ref={audioRef}
-          src={activeAudioUrl}
+          src={activeMediaUrl}
           preload="metadata"
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
@@ -312,7 +426,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         />
       )}
 
-      {/* Header Info: Sender, Time, Read status */}
+      {/* Header Info: Sender, Time, Delivery / Read status */}
       <div className="flex items-center gap-1.5 mb-1 px-1 text-[10px] text-zinc-400 dark:text-zinc-500 font-medium">
         {isInbound ? (
           <>
@@ -335,7 +449,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           })}
         </time>
 
-        {/* Honest Delivery Status (1 Checkmark vs 2 Checkmarks) */}
         {!isInbound && (
           <div className="flex items-center gap-1">
             {message.delivery_status === "failed" ? (
@@ -390,71 +503,330 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
       {/* Main Bubble Container */}
       <div
-        className={`max-w-[85%] sm:max-w-[75%] rounded-2xl p-3 text-xs leading-relaxed shadow-2xs ${
+        className={`max-w-[88%] sm:max-w-[80%] rounded-2xl p-3 text-xs leading-relaxed shadow-2xs ${
           isInbound
             ? "bg-white dark:bg-zinc-800/95 text-zinc-900 dark:text-zinc-100 border border-zinc-200/90 dark:border-zinc-800 rounded-tl-sm"
             : "bg-teal-700 text-white rounded-tr-sm shadow-xs"
         }`}
       >
-        {/* A. PHOTO ATTACHMENT */}
-        {hasPhoto && photoUrl && (
+        {/* ========================================================================= */}
+        {/* TELEGRAM LOADING ERROR STUB: (ERR_CONNECTION_TIMED_OUT / CORS / NETWORK)  */}
+        {/* ========================================================================= */}
+        {loadError && (
+          <div
+            className={`p-3 rounded-xl border mb-2 flex flex-col items-center justify-center gap-2 text-center shadow-2xs ${
+              isInbound
+                ? "bg-amber-50/90 dark:bg-amber-950/40 border-amber-300 dark:border-amber-800 text-amber-950 dark:text-amber-200"
+                : "bg-teal-850 border-amber-400/60 text-white"
+            }`}
+          >
+            <div className="flex items-center gap-1.5 font-semibold text-xs text-amber-700 dark:text-amber-300">
+              <AlertTriangle size={16} className="text-amber-500 shrink-0" />
+              <span>⚠️ Ошибка загрузки из Telegram</span>
+            </div>
+            <p className="text-[11px] opacity-85 max-w-xs leading-tight">
+              Сбой соединения с api.telegram.org (ERR_CONNECTION_TIMED_OUT). Нажмите кнопку ниже для повторной попытки через локальный прокси.
+            </p>
+            <div className="flex items-center gap-2 mt-0.5">
+              <button
+                type="button"
+                onClick={handleRetryLoad}
+                disabled={isRetrying}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-medium text-xs transition-colors shadow-2xs cursor-pointer active:scale-95"
+              >
+                <RefreshCw size={12} className={isRetrying ? "animate-spin" : ""} />
+                <span>{isRetrying ? "Загрузка..." : "Нажмите для повторной попытки"}</span>
+              </button>
+              {activeMediaUrl && (
+                <a
+                  href={activeMediaUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-amber-400/50 hover:bg-amber-100/50 dark:hover:bg-amber-900/40 text-xs transition-colors"
+                  title="Открыть прямую ссылку"
+                >
+                  <ExternalLink size={12} />
+                  <span>Открыть</span>
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* A. VIDEO ATTACHMENT (Standard Video, .mp4, .mov, .webm, animation)        */}
+        {/* ========================================================================= */}
+        {isVideo && !isVideoNote && (
+          <div className="mb-2 space-y-2">
+            <div className="relative rounded-xl overflow-hidden border border-zinc-200/80 dark:border-zinc-700 bg-black shadow-sm group">
+              {activeMediaUrl ? (
+                <video
+                  src={activeMediaUrl}
+                  controls
+                  preload="metadata"
+                  playsInline
+                  className="w-full max-h-72 object-contain bg-black"
+                  onError={() => {
+                    if (!blobUrl && (message.file_path || message.media_url)) {
+                      setLoadError(true);
+                    }
+                  }}
+                />
+              ) : (
+                <div className="h-44 w-full flex flex-col items-center justify-center gap-2 text-zinc-400 bg-zinc-950">
+                  {isLoadingBlob ? (
+                    <>
+                      <RefreshCw size={24} className="animate-spin text-teal-400" />
+                      <span className="text-xs text-teal-300">Загрузка видеоплеера...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Film size={32} />
+                      <span className="text-xs">Видео недоступно для предпросмотра</span>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Action buttons under video player: "Увеличить видео" and "Скачать" */}
+            <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">
+              <div
+                className={`flex items-center gap-1.5 text-[11px] font-mono truncate max-w-[160px] sm:max-w-[200px] ${
+                  isInbound ? "text-zinc-500 dark:text-zinc-400" : "text-teal-100"
+                }`}
+                title={resolvedFileName}
+              >
+                <Film size={13} className="text-teal-500 shrink-0" />
+                <span className="truncate">{resolvedFileName}</span>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsVideoModalOpen(true)}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer border shadow-2xs ${
+                    isInbound
+                      ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      : "bg-teal-850 text-white border-teal-600/60 hover:bg-teal-900"
+                  }`}
+                  title="Развернуть видео в модальном окне"
+                >
+                  <Maximize2 size={12} />
+                  <span>Увеличить видео</span>
+                </button>
+
+                <a
+                  href={activeMediaUrl || "#"}
+                  download={resolvedFileName}
+                  onClick={handleDownloadMedia}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer border shadow-2xs ${
+                    isInbound
+                      ? "bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300 border-teal-200 dark:border-teal-800 hover:bg-teal-100"
+                      : "bg-white text-teal-900 border-white hover:bg-zinc-100"
+                  }`}
+                  title="Скачать видео на ПК или телефон"
+                >
+                  {isDownloading ? (
+                    <RefreshCw size={12} className="animate-spin" />
+                  ) : (
+                    <Download size={12} />
+                  )}
+                  <span>Скачать</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* B. VIDEO NOTE (Кружочек Telegram со встроенным плеером и кнопками)        */}
+        {/* ========================================================================= */}
+        {isVideoNote && (
+          <div className="my-2 flex flex-col items-center gap-2">
+            <div className="relative w-44 h-44 sm:w-52 sm:h-52 rounded-full overflow-hidden border-4 border-teal-500 shadow-md bg-zinc-950 flex items-center justify-center group">
+              {activeMediaUrl ? (
+                <video
+                  ref={videoRef}
+                  src={activeMediaUrl}
+                  playsInline
+                  controls
+                  loop
+                  className="w-full h-full object-cover"
+                  onPlay={() => setIsVideoPlaying(true)}
+                  onPause={() => setIsVideoPlaying(false)}
+                  onEnded={() => setIsVideoPlaying(false)}
+                  onError={() => {
+                    if (!blobUrl && (message.file_path || message.media_url)) {
+                      setLoadError(true);
+                    }
+                  }}
+                />
+              ) : (
+                <div className="flex flex-col items-center justify-center text-teal-400 p-4 text-center">
+                  {isLoadingBlob ? (
+                    <RefreshCw size={24} className="animate-spin mb-1 text-teal-400" />
+                  ) : (
+                    <Video size={36} className="mb-1 text-teal-400" />
+                  )}
+                  <span className="text-[11px] font-semibold">
+                    {isLoadingBlob ? "Загрузка видео..." : "Видеокружок TG"}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setIsVideoModalOpen(true)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer border shadow-2xs ${
+                  isInbound
+                    ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-200"
+                    : "bg-teal-850 text-white border-teal-600/60 hover:bg-teal-900"
+                }`}
+              >
+                <Maximize2 size={11} />
+                <span>Увеличить видео</span>
+              </button>
+
+              <a
+                href={activeMediaUrl || "#"}
+                download="video_note.mp4"
+                onClick={handleDownloadMedia}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer border shadow-2xs ${
+                  isInbound
+                    ? "bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300 border-teal-200 dark:border-teal-800 hover:bg-teal-100"
+                    : "bg-white text-teal-900 border-white hover:bg-zinc-100"
+                }`}
+              >
+                <Download size={11} />
+                <span>Скачать</span>
+              </a>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* C. PHOTO ATTACHMENT (Карточка с картинкой, кнопками «Увеличить» и «Скачать»)*/}
+        {/* ========================================================================= */}
+        {isPhoto && activeMediaUrl && (
           <div className="space-y-2 mb-2">
             {imageError ? (
               <div className="p-3 bg-zinc-100 dark:bg-zinc-800/90 rounded-xl border border-zinc-200 dark:border-zinc-700 flex flex-col items-center justify-center gap-2 text-center my-1">
                 <div className="flex items-center gap-1.5 text-zinc-500 dark:text-zinc-400">
                   <Camera size={20} />
-                  <span className="text-[11px] font-medium">Не удалось загрузить превью фото</span>
+                  <span className="text-[11px] font-medium">Не удалось отобразить превью фото</span>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleRetryLoad}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white font-medium text-xs transition-colors shadow-2xs cursor-pointer"
+                  >
+                    <RefreshCw size={13} />
+                    <span>Повторить загрузку</span>
+                  </button>
                   <a
-                    href={photoUrl}
+                    href={activeMediaUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white font-medium text-xs transition-colors shadow-2xs"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-600 text-xs font-medium"
                   >
-                    <Eye size={13} />
-                    <span>📷 Скачать / Открыть фото</span>
+                    <ExternalLink size={13} />
+                    <span>Открыть</span>
                   </a>
                 </div>
               </div>
             ) : (
-              <div
-                className="relative group rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 cursor-pointer max-h-72 flex items-center justify-center"
-                onClick={() =>
-                  onPreviewImage &&
-                  onPreviewImage(photoUrl, messageText || "Фотография от клиента")
-                }
-              >
-                <img
-                  src={photoUrl}
-                  alt={messageText || "Вложение фото"}
-                  onError={() => setImageError(true)}
-                  className="w-full h-auto object-cover max-h-72 transition-transform duration-200 group-hover:scale-[1.02]"
-                  loading="lazy"
-                />
-                <div className="absolute inset-0 bg-black/35 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2 text-white text-xs font-medium">
-                  <span className="bg-black/70 px-2.5 py-1 rounded-full flex items-center gap-1.5 backdrop-blur-xs">
-                    <Eye size={13} />
-                    <span>Увеличить фото</span>
-                  </span>
-                  <a
-                    href={photoUrl}
-                    download="photo.jpg"
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    className="bg-black/70 p-1.5 rounded-full hover:bg-black/90 transition-colors"
-                    title="Скачать исходный файл"
+              <div className="space-y-1.5">
+                <div
+                  className="relative group rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 cursor-pointer max-h-72 flex items-center justify-center"
+                  onClick={handleOpenPhoto}
+                >
+                  <img
+                    src={activeMediaUrl}
+                    alt={messageText || "Вложение фото"}
+                    onError={() => setImageError(true)}
+                    className="w-full h-auto object-cover max-h-72 transition-transform duration-200 group-hover:scale-[1.02]"
+                    loading="lazy"
+                  />
+                  {/* Hover overlay with action buttons */}
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2 text-white text-xs font-medium backdrop-blur-[1px]">
+                    <span className="bg-black/75 px-3 py-1.5 rounded-full flex items-center gap-1.5 backdrop-blur-xs shadow-md">
+                      <Eye size={14} />
+                      <span>Увеличить фото</span>
+                    </span>
+                    <a
+                      href={activeMediaUrl}
+                      download={resolvedFileName}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDownloadMedia(e);
+                      }}
+                      className="bg-black/75 p-2 rounded-full hover:bg-black/90 transition-colors shadow-md"
+                      title="Скачать фото"
+                    >
+                      <Download size={14} />
+                    </a>
+                  </div>
+                </div>
+
+                {/* Permanent action footer under photo for convenient mobile / click access */}
+                <div className="flex items-center justify-between gap-2 px-0.5 pt-0.5">
+                  <div
+                    className={`flex items-center gap-1 text-[11px] truncate max-w-[160px] sm:max-w-[200px] ${
+                      isInbound ? "text-zinc-500 dark:text-zinc-400" : "text-teal-100"
+                    }`}
                   >
-                    <Download size={13} />
-                  </a>
+                    <Camera size={12} className="text-teal-500 shrink-0" />
+                    <span className="truncate">{resolvedFileName}</span>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleOpenPhoto}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer border shadow-2xs ${
+                        isInbound
+                          ? "bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                          : "bg-teal-850 text-white border-teal-600/60 hover:bg-teal-900"
+                      }`}
+                    >
+                      <Eye size={12} />
+                      <span>Увеличить фото</span>
+                    </button>
+
+                    <a
+                      href={activeMediaUrl || "#"}
+                      download={resolvedFileName}
+                      onClick={handleDownloadMedia}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer border shadow-2xs ${
+                        isInbound
+                          ? "bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300 border-teal-200 dark:border-teal-800 hover:bg-teal-100"
+                          : "bg-white text-teal-900 border-white hover:bg-zinc-100"
+                      }`}
+                      title="Скачать фото на устройство"
+                    >
+                      {isDownloading ? (
+                        <RefreshCw size={12} className="animate-spin" />
+                      ) : (
+                        <Download size={12} />
+                      )}
+                      <span>Скачать</span>
+                    </a>
+                  </div>
                 </div>
               </div>
             )}
           </div>
         )}
 
-        {/* B. VOICE MESSAGE PLAYER (Telegram / VK Audio Message) */}
+        {/* ========================================================================= */}
+        {/* D. VOICE MESSAGE PLAYER (Telegram / VK Audio Message)                     */}
+        {/* ========================================================================= */}
         {isVoice && (
           <div
             className={`p-2.5 rounded-xl border mb-1.5 flex flex-col gap-2 ${
@@ -464,7 +836,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             }`}
           >
             <div className="flex items-center gap-2.5">
-              {/* Play / Pause button */}
               <button
                 type="button"
                 onClick={togglePlay}
@@ -478,7 +849,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 {isPlaying ? <Pause size={15} /> : <Play size={15} className="ml-0.5" />}
               </button>
 
-              {/* Waveform Visualization Bars */}
               <div className="flex-1 flex items-center gap-0.5 h-7 px-1">
                 {[
                   35, 60, 40, 85, 55, 95, 70, 45, 80, 100, 65, 45, 90, 75, 40, 60, 85, 50,
@@ -512,7 +882,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 })}
               </div>
 
-              {/* Speed toggle chip */}
               <button
                 type="button"
                 onClick={cycleSpeed}
@@ -527,7 +896,6 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
               </button>
             </div>
 
-            {/* Timer & Meta */}
             <div
               className={`flex items-center justify-between text-[10px] px-1 ${
                 isInbound ? "text-zinc-500 dark:text-zinc-400" : "text-teal-100"
@@ -545,58 +913,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           </div>
         )}
 
-        {/* C. VIDEO NOTE (Кружочек Telegram со встроенным плеером) */}
-        {isVideoNote && (
-          <div className="my-1.5 flex flex-col items-center">
-            <div className="relative w-44 h-44 sm:w-52 sm:h-52 rounded-full overflow-hidden border-4 border-teal-500 shadow-md bg-zinc-950 flex items-center justify-center group">
-              {activeVideoUrl ? (
-                <video
-                  ref={videoRef}
-                  src={activeVideoUrl}
-                  playsInline
-                  controls
-                  loop
-                  className="w-full h-full object-cover"
-                  onPlay={() => setIsVideoPlaying(true)}
-                  onPause={() => setIsVideoPlaying(false)}
-                  onEnded={() => setIsVideoPlaying(false)}
-                />
-              ) : (
-                <div className="flex flex-col items-center justify-center text-teal-400 p-4 text-center">
-                  {isLoadingBlob ? (
-                    <RefreshCw size={24} className="animate-spin mb-1 text-teal-400" />
-                  ) : (
-                    <Video size={36} className="mb-1 text-teal-400" />
-                  )}
-                  <span className="text-[11px] font-semibold">
-                    {isLoadingBlob ? "Загрузка видео..." : "Видеокружок TG"}
-                  </span>
-                </div>
-              )}
-            </div>
-            <span
-              className={`text-[10px] mt-1.5 font-mono ${
-                isInbound ? "text-zinc-500 dark:text-zinc-400" : "text-teal-100"
-              }`}
-            >
-              Кружочек Telegram · {formatSeconds(durationSec)}
-            </span>
-          </div>
-        )}
-
-        {/* C2. STANDARD VIDEO ATTACHMENT */}
-        {isVideo && activeVideoUrl && (
-          <div className="my-1.5 rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700 bg-black">
-            <video
-              src={activeVideoUrl}
-              controls
-              playsInline
-              className="max-h-72 w-full object-contain"
-            />
-          </div>
-        )}
-
-        {/* D. DOCUMENT ATTACHMENT (Карточка с иконкой, названием и кнопками) */}
+        {/* ========================================================================= */}
+        {/* E. DOCUMENT ATTACHMENT (Only genuine non-photo, non-video documents)      */}
+        {/* ========================================================================= */}
         {isDoc && (
           <div
             className={`p-2.5 rounded-xl border mb-1.5 flex items-center justify-between gap-3 ${
@@ -606,13 +925,13 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             } transition-colors`}
           >
             <div className="flex items-center gap-2.5 min-w-0">
-              {getDocumentIcon(docName)}
+              {getDocumentIcon(resolvedFileName)}
               <div className="min-w-0">
                 <div
                   className="font-semibold text-xs truncate max-w-[180px] sm:max-w-[240px]"
-                  title={docName}
+                  title={resolvedFileName}
                 >
-                  {docName}
+                  {resolvedFileName}
                 </div>
                 <div
                   className={`text-[10px] ${
@@ -625,9 +944,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             </div>
 
             <div className="flex items-center gap-1.5 shrink-0">
-              {activeDocUrl && (
+              {activeMediaUrl && (
                 <a
-                  href={activeDocUrl}
+                  href={activeMediaUrl}
                   target="_blank"
                   rel="noreferrer"
                   className={`p-1.5 rounded-lg border transition-colors ${
@@ -641,17 +960,17 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 </a>
               )}
               <a
-                href={activeDocUrl || "#"}
-                download={docName}
-                onClick={handleDownloadDocument}
+                href={activeMediaUrl || "#"}
+                download={resolvedFileName}
+                onClick={handleDownloadMedia}
                 className={`p-1.5 px-2 rounded-lg border flex items-center gap-1 text-[10px] font-semibold transition-colors cursor-pointer ${
                   isInbound
                     ? "bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300 border-teal-200 dark:border-teal-800 hover:bg-teal-100"
                     : "bg-white text-teal-900 border-white hover:bg-zinc-100 shadow-2xs"
                 }`}
-                title="Скачать файл на ПК"
+                title="Скачать файл"
               >
-                {isDownloadingDoc ? (
+                {isDownloading ? (
                   <RefreshCw size={12} className="animate-spin" />
                 ) : (
                   <Download size={13} />
@@ -662,9 +981,113 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           </div>
         )}
 
-        {/* E. MESSAGE TEXT / CAPTION */}
+        {/* F. MESSAGE TEXT / CAPTION */}
         {messageText && <p className="whitespace-pre-wrap leading-relaxed">{messageText}</p>}
       </div>
+
+      {/* ========================================================================= */}
+      {/* FULLSCREEN LIGHTBOX MODAL: VIDEO                                          */}
+      {/* ========================================================================= */}
+      {isVideoModalOpen && activeMediaUrl && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-150"
+          onClick={() => setIsVideoModalOpen(false)}
+        >
+          <div
+            className="relative w-full max-w-4xl max-h-[92vh] bg-zinc-950 rounded-2xl overflow-hidden shadow-2xl border border-zinc-800 flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 bg-zinc-900 border-b border-zinc-800 text-white">
+              <div className="flex items-center gap-2 min-w-0 pr-4">
+                <Film size={16} className="text-teal-400 shrink-0" />
+                <span className="text-xs font-semibold truncate">
+                  {messageText || resolvedFileName || "Видеозапись"}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={activeMediaUrl}
+                  download={resolvedFileName}
+                  className="px-2.5 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+                  title="Скачать видеофайл"
+                >
+                  <Download size={14} />
+                  <span>Скачать</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setIsVideoModalOpen(false)}
+                  className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
+                  title="Закрыть (Esc)"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-4 flex items-center justify-center bg-black">
+              <video
+                src={activeMediaUrl}
+                controls
+                autoPlay
+                playsInline
+                className="max-w-full max-h-[78vh] object-contain rounded-lg"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* FULLSCREEN LIGHTBOX MODAL: PHOTO                                          */}
+      {/* ========================================================================= */}
+      {isPhotoModalOpen && activeMediaUrl && !onPreviewImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-150"
+          onClick={() => setIsPhotoModalOpen(false)}
+        >
+          <div
+            className="relative w-full max-w-4xl max-h-[92vh] bg-zinc-950 rounded-2xl overflow-hidden shadow-2xl border border-zinc-800 flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 bg-zinc-900 border-b border-zinc-800 text-white">
+              <div className="flex items-center gap-2 min-w-0 pr-4">
+                <Camera size={16} className="text-teal-400 shrink-0" />
+                <span className="text-xs font-semibold truncate">
+                  {messageText || "Фотография от клиента"}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={activeMediaUrl}
+                  download={resolvedFileName}
+                  className="px-2.5 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
+                  title="Скачать фото"
+                >
+                  <Download size={14} />
+                  <span>Скачать</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setIsPhotoModalOpen(false)}
+                  className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
+                  title="Закрыть (Esc)"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-4 flex items-center justify-center bg-black">
+              <img
+                src={activeMediaUrl}
+                alt={messageText || "Фотография"}
+                className="max-w-full max-h-[78vh] object-contain rounded-lg"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

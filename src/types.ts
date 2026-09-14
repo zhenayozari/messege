@@ -106,7 +106,7 @@ export interface Contact {
   notes?: string | null;
 }
 
-export type MediaType = "photo" | "voice" | "video_note" | "video" | "document" | "text";
+export type MediaType = "photo" | "voice" | "video_note" | "video" | "animation" | "document" | "text";
 
 export interface Message {
   id: string;
