@@ -25,6 +25,8 @@ from app.models import (
     AiSuggestion,
     AiSuggestionMode,
     AiSuggestionStatus,
+    Channel,
+    ChannelType,
     Contact,
     Conversation,
     Lead,
@@ -299,79 +301,168 @@ def merge_contacts(
     return main_contact, len(convs), len(leads)
 
 
-def create_inbound_message(session: Session, payload: TestInboundRequest) -> Message:
+def create_inbound_message(
+    session: Session, payload: TestInboundRequest
+) -> tuple[Message, Conversation, Lead]:
     """
-    Обработка входящего сообщения из мессенджера (Telegram, ВКонтакте):
-    1. Поиск существующего диалога по external_chat_id и каналу.
-    2. Если пишет новый пользователь:
-       - Создается запись Contact (с именем из Telegram/VK и username).
-       - Привязывается к активному проекту (ниша по умолчанию 'ceilings').
-       - Создается Conversation с привязкой к проекту.
-       - Создается карточка Lead со статусом 'новый' и температурой 'теплый'.
-    3. Создается и сохраняется входящее сообщение Message (с медиа-вложениями при наличии).
-    4. Обновляется unread_count, last_text, last_message_at в Conversation.
-    5. Запускается генерация первичного черновика ответа через AI Copilot.
+    Обработка входящего сообщения из мессенджера (Telegram, ВКонтакте, Max):
+    1. Найти или создать активный Project (Project.is_active == True). Если нет — создать 'ФЕНИКС PRO Потолки'.
+    2. Найти или создать Channel (Channel.type == payload.channel, project_id=project.id, is_active=True).
+       Обязательно сделать session.flush(), чтобы у канала появился channel.id!
+    3. Найти или создать Contact (по external_id == payload.external_contact_id или имени).
+    4. Найти существующий Conversation (where Conversation.channel_id == channel.id, Conversation.external_chat_id == payload.external_chat_id).
+       Если диалога нет — создать новый Conversation, передав ОБЯЗАТЕЛЬНО channel_id=channel.id, project_id=project.id, contact_id=contact.id.
+    5. Найти или создать Lead для этого диалога.
+    6. Сохранить Message со всеми медиа-полями (media_type, media_url, file_id, file_name, file_size, duration_sec, caption, attachments).
+    7. Выполнить session.commit() и вернуть (message, conversation, lead).
     """
-    # 1. Поиск диалога
-    conv = session.exec(
-        select(Conversation).where(
-            Conversation.external_chat_id == payload.external_chat_id,
-            Conversation.channel == payload.channel,
+    # 1. Поиск или создание активного проекта
+    project = session.exec(
+        select(Project).where(Project.is_active == True)
+    ).first()
+
+    if not project:
+        project = Project(
+            name="ФЕНИКС PRO Потолки",
+            slug="feniks-pro-ceilings",
+            niche_type="ceilings",
+            description="Натяжные потолки премиум качества под ключ",
+            system_prompt=(
+                "Ты — опытный AI-ассистент менеджера компании 'ФЕНИКС PRO Потолки'. "
+                "Твоя задача — вежливо квалифицировать запрос клиента, выявлять параметры объекта (площадь, тип профиля, освещение) "
+                "и мягко закрывать на бесплатный замер мастера."
+            ),
+            is_active=True,
+            color="#0f766e",
+        )
+        session.add(project)
+        session.flush()
+
+    # 2. Поиск или создание канала (session.flush() гарантирует наличие channel.id)
+    channel = session.exec(
+        select(Channel).where(
+            Channel.type == payload.channel,
+            Channel.project_id == project.id,
+            Channel.is_active == True,
         )
     ).first()
 
+    if not channel:
+        channel_name = f"Канал {payload.channel.value.upper() if hasattr(payload.channel, 'value') else str(payload.channel).upper()}"
+        channel = Channel(
+            project_id=project.id,
+            type=payload.channel,
+            name=channel_name,
+            is_active=True,
+            settings={},
+            last_sync_at=utc_now(),
+        )
+        session.add(channel)
+        session.flush()
+
+    if not channel.id:
+        session.flush()
+
+    # 3. Поиск или создание контакта (по external_id == payload.external_contact_id)
     contact: Contact | None = None
-    if conv:
-        contact = session.get(Contact, conv.contact_id)
-    else:
-        # Поиск контакта по имени или создание нового
+    if payload.external_contact_id:
+        contact = session.exec(
+            select(Contact).where(Contact.external_id == payload.external_contact_id)
+        ).first()
+
+    if not contact and payload.contact_name:
         contact = session.exec(
             select(Contact).where(Contact.name == payload.contact_name)
         ).first()
 
     if not contact:
         contact = Contact(
-            name=payload.contact_name,
+            name=payload.contact_name or "Клиент",
+            external_id=payload.external_contact_id,
             phone=payload.phone,
             city=payload.city,
             primary_channel=payload.channel,
         )
         session.add(contact)
         session.flush()
-
-    if not conv:
-        # Находим проект по умолчанию ('ceilings' или первый активный)
-        project = session.exec(
-            select(Project).where(Project.niche_type == "ceilings", Project.is_active == True)
-        ).first()
-        if not project:
-            project = session.exec(select(Project).where(Project.is_active == True)).first()
-        if not project:
-            project = Project(
-                name="Потолки Премиум",
-                slug="ceilings",
-                niche_type="ceilings",
-                description="Натяжные потолки под ключ",
-                system_prompt="Ты AI-помощник компании Потолки Премиум. Отвечай вежливо, выявляй площадь и предлагай бесплатный замер.",
-                is_active=True,
-            )
-            session.add(project)
+    else:
+        # Актуализируем external_id, телефон или город, если появились новые данные
+        updated = False
+        if payload.external_contact_id and not contact.external_id:
+            contact.external_id = payload.external_contact_id
+            updated = True
+        if payload.phone and not contact.phone:
+            contact.phone = payload.phone
+            updated = True
+        if payload.city and not contact.city:
+            contact.city = payload.city
+            updated = True
+        if updated:
+            session.add(contact)
             session.flush()
 
+    # 4. Поиск существующего диалога или создание нового с обязательным channel_id
+    conv = session.exec(
+        select(Conversation).where(
+            Conversation.channel_id == channel.id,
+            Conversation.external_chat_id == payload.external_chat_id,
+        )
+    ).first()
+
+    # Fallback-поиск для ранее созданных записей
+    if not conv:
+        conv = session.exec(
+            select(Conversation).where(
+                Conversation.external_chat_id == payload.external_chat_id,
+                Conversation.contact_id == contact.id,
+            )
+        ).first()
+        if conv and not conv.channel_id:
+            conv.channel_id = channel.id
+
+    display_text = payload.text or payload.caption
+    if not display_text and payload.media_type:
+        type_labels = {
+            "photo": "📷 Фотография",
+            "voice": "🎤 Голосовое сообщение",
+            "video_note": "📹 Видеосообщение",
+            "video": "🎬 Видеозапись",
+            "animation": "🎞 Анимация",
+            "document": f"📄 {payload.file_name or 'Документ'}",
+        }
+        display_text = type_labels.get(payload.media_type, f"[{payload.media_type}]")
+    last_text = display_text or "Входящее сообщение"
+
+    if not conv:
         conv = Conversation(
+            channel_id=channel.id,
             project_id=project.id,
             contact_id=contact.id,
             channel=payload.channel,
             external_chat_id=payload.external_chat_id,
             status="open",
             unread_count=0,
-            last_text=payload.text or payload.caption or "Входящее сообщение",
+            last_text=last_text,
             last_message_at=utc_now(),
         )
         session.add(conv)
         session.flush()
+    else:
+        # Гарантируем, что ни при каких обстоятельствах channel_id не равен None
+        if not conv.channel_id:
+            conv.channel_id = channel.id
+        if not conv.project_id:
+            conv.project_id = project.id
+        if not conv.contact_id:
+            conv.contact_id = contact.id
+        conv.channel = payload.channel
 
-        # Создание карточки Lead со статусом 'новый' и температурой 'теплый'
+    # 5. Поиск или создание лида для этого диалога
+    lead = session.exec(
+        select(Lead).where(Lead.conversation_id == conv.id)
+    ).first()
+
+    if not lead:
         lead = Lead(
             project_id=project.id,
             contact_id=contact.id,
@@ -383,24 +474,15 @@ def create_inbound_message(session: Session, payload: TestInboundRequest) -> Mes
         session.add(lead)
         session.flush()
     else:
-        # Если диалог есть, проверяем наличие лида
-        existing_lead = session.exec(
-            select(Lead).where(Lead.conversation_id == conv.id)
-        ).first()
-        if not existing_lead:
-            new_lead = Lead(
-                project_id=conv.project_id,
-                contact_id=conv.contact_id,
-                conversation_id=conv.id,
-                source=payload.channel,
-                status="новый",
-                temperature="теплый",
-            )
-            session.add(new_lead)
-            session.flush()
+        if not lead.project_id:
+            lead.project_id = project.id
+            session.add(lead)
+        if not lead.contact_id:
+            lead.contact_id = contact.id
+            session.add(lead)
 
-    # 3. Сохранение сообщения
-    msg = Message(
+    # 6. Сохранение сообщения со всеми медиа-полями
+    message = Message(
         conversation_id=conv.id,
         direction=MessageDirection.inbound,
         sender_type=SenderType.client,
@@ -412,34 +494,27 @@ def create_inbound_message(session: Session, payload: TestInboundRequest) -> Mes
         file_name=payload.file_name,
         file_size=payload.file_size,
         duration_sec=payload.duration_sec,
-        attachments=payload.attachments,
+        attachments=payload.attachments or [],
         external_message_id=payload.external_message_id,
         delivery_status="received",
         is_read=False,
         created_at=utc_now(),
     )
-    session.add(msg)
+    session.add(message)
 
-    # 4. Обновление диалога
+    # Обновление счетчиков и последнего текста диалога
     conv.unread_count = (conv.unread_count or 0) + 1
-    display_text = payload.text or payload.caption
-    if not display_text and payload.media_type:
-        type_labels = {
-            "photo": "📷 Фотография",
-            "voice": "🎤 Голосовое сообщение",
-            "video_note": "📹 Видеосообщение",
-            "document": f"📄 {payload.file_name or 'Документ'}",
-        }
-        display_text = type_labels.get(payload.media_type, f"[{payload.media_type}]")
-    conv.last_text = display_text or "Входящее сообщение"
+    conv.last_text = last_text
     conv.last_message_at = utc_now()
     session.add(conv)
 
+    # 7. Фиксация изменений в базе и возврат (message, conversation, lead)
     session.commit()
-    session.refresh(msg)
+    session.refresh(message)
     session.refresh(conv)
+    session.refresh(lead)
 
-    # 5. Фоновый вызов AI Copilot для генерации первичного черновика ответа
+    # Фоновый вызов AI Copilot для генерации первичного черновика ответа
     try:
         from app.db.session import engine
 
@@ -457,5 +532,5 @@ def create_inbound_message(session: Session, payload: TestInboundRequest) -> Mes
     except Exception as exc:
         logger.warning("Could not schedule copilot suggestion: %s", exc)
 
-    return msg
+    return message, conv, lead
 

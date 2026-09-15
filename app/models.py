@@ -49,6 +49,7 @@ class Contact(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str = Field(index=True)
     phone: str | None = Field(default=None, index=True)
+    external_id: str | None = Field(default=None, index=True)
     email: str | None = None
     primary_channel: ChannelType = ChannelType.test
     city: str | None = None
@@ -56,9 +57,21 @@ class Contact(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class Channel(SQLModel, table=True):
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    project_id: UUID | None = Field(default=None, foreign_key="project.id", index=True)
+    type: ChannelType = Field(index=True)
+    name: str
+    is_active: bool = True
+    settings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    last_sync_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class Conversation(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     project_id: UUID | None = Field(default=None, foreign_key="project.id", index=True)
+    channel_id: UUID = Field(foreign_key="channel.id", index=True)
     contact_id: UUID = Field(foreign_key="contact.id", index=True)
     channel: ChannelType = ChannelType.test
     external_chat_id: str = Field(index=True)

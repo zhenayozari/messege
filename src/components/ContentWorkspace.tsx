@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  Bot,
   Calendar,
   Check,
   CheckCircle,
@@ -8,22 +9,26 @@ import {
   ChevronUp,
   Clock,
   Copy,
+  Cpu,
   Edit3,
   ExternalLink,
   FileText,
   Gift,
   Hash,
   Image as ImageIcon,
+  Key,
   Plus,
   RefreshCw,
   Save,
   Send,
+  Server,
   Sliders,
   Sparkles,
   Tag,
   Target,
   Trash2,
   UploadCloud,
+  Wand2,
   X,
   Zap,
 } from "lucide-react";
@@ -37,6 +42,11 @@ import {
 } from "../types";
 import { MediaLibrary } from "./MediaLibrary";
 import { api } from "../services/api";
+import {
+  LLMProviderType,
+  generatePostFromPrompt,
+  analyzeAndAdaptAuthorPost,
+} from "../services/llmService";
 
 interface ContentWorkspaceProps {
   activeProject: Project;
@@ -152,6 +162,46 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
 
   // AI adaptation running indicator
   const [isAdaptingAi, setIsAdaptingAi] = useState(false);
+
+  // LLM Provider & AI Assistant state
+  const [llmProvider, setLlmProvider] = useState<LLMProviderType>(() => {
+    return (localStorage.getItem("phoenix_llm_provider") as LLMProviderType) || "local_llama";
+  });
+  const [openaiApiKey, setOpenaiApiKey] = useState<string>(() => {
+    return localStorage.getItem("phoenix_openai_key") || "";
+  });
+  const [isAiPanelOpen, setIsAiPanelOpen] = useState(true);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [isGeneratingPost, setIsGeneratingPost] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [tempApiKey, setTempApiKey] = useState("");
+
+  const promptPresets = [
+    {
+      id: "estimate",
+      icon: "💡",
+      label: "Идея на тему сметы",
+      text: "Расскажи, из чего складывается честная смета на натяжной потолок в комнату 18 м², почему называть фиксированную цифру по телефону — обман, и как честная смета защищает от переплат.",
+    },
+    {
+      id: "case",
+      icon: "📐",
+      label: "Кейс с объекта",
+      text: "Опиши свежий кейс монтажа в новостройке: гостиная 24 м² с теневым профилем EuroKRAAB, скрытым карнизом ПК-5 с подсветкой и световыми линиями. Было 8 углов, справились за 1 день без пыли.",
+    },
+    {
+      id: "profiles",
+      icon: "🛠",
+      label: "Сравнение профилей",
+      text: "Сравни классический натяжной потолок со вставкой (маскировочной лентой) и теневой профиль EuroKRAAB. Почему теневой зазор 6 мм выглядит стильнее и никогда не желтеет со временем.",
+    },
+    {
+      id: "promo",
+      icon: "⚡",
+      label: "Акция недели",
+      text: "Объяви акцию недели: скидка 10% для новосёлов при комплексном заказе потолков во всей квартире + бесплатный выезд инженера-технолога с каталогом образцов и лазерным дальномером.",
+    },
+  ];
 
   // Drag-and-drop upload state
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -343,124 +393,45 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
     showToast("info", "Создан новый черновик", "Напишите текст или тезисы поста");
   };
 
-  // 2. AI Adaptation: «🪄 Заполнить параметры и адаптировать через ИИ»
-  const handleAiAdapt = async () => {
-    if (!selectedItem) return;
+  const handleSelectProvider = (provider: LLMProviderType) => {
+    setLlmProvider(provider);
+    localStorage.setItem("phoenix_llm_provider", provider);
+    if (provider === "openai" && !openaiApiKey) {
+      setTempApiKey("");
+      setShowApiKeyModal(true);
+    }
+  };
 
-    const sourceText = editorText.trim() || postTitle.trim();
-    if (!sourceText || sourceText === "Новый пост") {
+  const handleSaveApiKey = () => {
+    const trimmed = tempApiKey.trim();
+    setOpenaiApiKey(trimmed);
+    localStorage.setItem("phoenix_openai_key", trimmed);
+    setShowApiKeyModal(false);
+    showToast("success", "Ключ OpenAI сохранен", "Модель GPT-4o-mini готова к генерации контента.");
+  };
+
+  // 1. Action: «🪄 Сгенерировать пост с нуля» через выбранную LLM
+  const handleGeneratePostFromScratch = async () => {
+    if (!selectedItem) return;
+    const promptText = aiPrompt.trim();
+    if (!promptText) {
       showToast(
         "info",
-        "Текст не введен",
-        "Напишите хотя бы пару предложений или тезисы поста, чтобы нейросеть могла их проанализировать и адаптировать."
+        "Укажите тему поста",
+        "Опишите идею, тезисы или нажмите на один из быстрых пресетов выше."
       );
       return;
     }
 
-    setIsAdaptingAi(true);
-
+    setIsGeneratingPost(true);
     try {
-      // Realistic brief AI delay for quality generation
-      await new Promise((r) => setTimeout(r, 650));
+      const res = await generatePostFromPrompt({
+        provider: llmProvider,
+        project: activeProject,
+        prompt: promptText,
+        openaiApiKey,
+      });
 
-      const lower = sourceText.toLowerCase();
-
-      // Intelligent rubric deduction
-      let inferredRubric = "Экспертный разбор";
-      if (
-        lower.includes("цен") ||
-        lower.includes("смет") ||
-        lower.includes("руб") ||
-        lower.includes("стоимост") ||
-        lower.includes("расчет")
-      ) {
-        inferredRubric = "Цены и сметы";
-      } else if (
-        lower.includes("скидк") ||
-        lower.includes("акци") ||
-        lower.includes("подарок") ||
-        lower.includes("бонус") ||
-        lower.includes("промокод")
-      ) {
-        inferredRubric = "Акции и скидки";
-      } else if (
-        lower.includes("до и после") ||
-        lower.includes("до/после") ||
-        lower.includes("объект") ||
-        lower.includes("квартир") ||
-        lower.includes("установили") ||
-        lower.includes("сделали") ||
-        lower.includes("кейс")
-      ) {
-        inferredRubric = "Кейсы и до/после";
-      } else if (
-        lower.includes("монтаж") ||
-        lower.includes("профиль") ||
-        lower.includes("теневой") ||
-        lower.includes("eurokraab") ||
-        lower.includes("узел") ||
-        lower.includes("гарпун")
-      ) {
-        inferredRubric = "Технологии монтажа";
-      } else if (
-        lower.includes("отзыв") ||
-        lower.includes("клиент") ||
-        lower.includes("благодар") ||
-        lower.includes("доволен")
-      ) {
-        inferredRubric = "Отзывы клиентов";
-      }
-
-      // Intelligent goal deduction
-      let inferredGoal = "lead_generation";
-      if (inferredRubric === "Акции и скидки") {
-        inferredGoal = "direct_sales";
-      } else if (inferredRubric === "Технологии монтажа" || inferredRubric === "Отзывы клиентов") {
-        inferredGoal = "trust";
-      } else if (lower.includes("как вам") || lower.includes("мнение") || lower.includes("выбираете")) {
-        inferredGoal = "engagement";
-      }
-
-      // Inferred trigger keyword
-      let inferredTrigger = "ЗАМЕР";
-      if (inferredRubric === "Цены и сметы") inferredTrigger = "СМЕТА";
-      else if (inferredRubric === "Акции и скидки") inferredTrigger = "СКИДКА";
-      else if (lower.includes("расчет") || lower.includes("посчит")) inferredTrigger = "РАСЧЕТ";
-
-      // Inferred offer
-      let inferredOffer =
-        activeProject.niche_type === "kitchens"
-          ? "Бесплатный 3D-проект под размеры помещения и расчет стоимости"
-          : activeProject.niche_type === "windows"
-          ? "Бесплатный аудит продуваний тепловизором и расчет остекления"
-          : "Бесплатный расчет точной сметы в 3-х вариантах и выезд замерщика с образцами";
-
-      if (lower.includes("скидк") || lower.includes("10%") || lower.includes("новосел")) {
-        inferredOffer = "Скидка 10% новоселам + бесплатный выезд замерщика с каталогом";
-      }
-
-      // Inferred title if title was default
-      const inferredTitle =
-        postTitle && postTitle !== "Новый пост"
-          ? postTitle
-          : sourceText.split("\n")[0].slice(0, 60);
-
-      // Synthesize adapted variants
-      const brand = activeProject.name;
-
-      // 1. VK Wall variant
-      const vkWallText = `${inferredTitle}\n\n${sourceText}\n\nГлавное в работе команды «${brand}» — открытая смета без скрытых наценок, премиальные полотна и профили, а также гарантия до 10 лет по официальному договору.\n\n🎁 Специальное предложение: ${inferredOffer}.\n\nКак вам такое решение? Делитесь мнением в комментариях! 👇\n\n📩 Чтобы зафиксировать за собой спецпредложение, напишите кодовое слово «${inferredTrigger}» в личные сообщения сообщества!\n\n#натяжныепотолки #теневойпотолок #ремонтквартир #eurokraab #дизайнинтерьера`;
-
-      // 2. Telegram variant (with HTML tags & bullets)
-      const tgText = `💡 <b>${inferredTitle}</b>\n\n${sourceText}\n\n<b>Преимущества от ${brand}:</b>\n• Прозрачная смета до копейки до начала работ\n• Фирменный монтаж без пыли за 1 день\n• Официальная гарантия 10 лет по договору\n\n⚡ <i>${inferredOffer}</i>\n\n👇 Напишите нашему боту кодовое слово <b>${inferredTrigger}</b>, чтобы получить точный расчет и забронировать выезд мастера!`;
-
-      // 3. VK Channel
-      const vkChannelText = `📊 Экспертный разбор: ${inferredTitle}\n\n${sourceText}\n\n1. Технический аудит и замер по лазерному дальномеру.\n2. Премиальные материалы без запаха с сертификатами качества.\n3. Чистый монтаж с промышленным пылесосом.\n\n🎯 Оффер: ${inferredOffer}.\n\nНапишите «${inferredTrigger}» в сообщения группы для персональной консультации технолога.`;
-
-      // 4. MAX
-      const maxText = `✨ ${inferredTitle}\n\n${sourceText}\n\n${inferredOffer}.\n\nОтправьте «${inferredTrigger}» в чат сообщества для быстрой оценки!`;
-
-      // Update variants array
       const updatedVariants: ContentVariant[] = [
         {
           id:
@@ -468,8 +439,8 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             `var-${Date.now()}-vk-wall`,
           content_item_id: selectedItem.id,
           channel: "vk_wall",
-          title: inferredTitle,
-          text: vkWallText,
+          title: res.title,
+          text: res.vk_text,
           format: "post",
           status: "draft",
         },
@@ -479,8 +450,8 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             `var-${Date.now()}-tg`,
           content_item_id: selectedItem.id,
           channel: "telegram",
-          title: inferredTitle,
-          text: tgText,
+          title: res.title,
+          text: res.tg_text,
           format: "post",
           status: "draft",
         },
@@ -490,8 +461,8 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             `var-${Date.now()}-vk-chan`,
           content_item_id: selectedItem.id,
           channel: "vk_channel",
-          title: inferredTitle,
-          text: vkChannelText,
+          title: res.title,
+          text: res.vk_channel_text || res.vk_text,
           format: "article",
           status: "draft",
         },
@@ -501,8 +472,8 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             `var-${Date.now()}-max`,
           content_item_id: selectedItem.id,
           channel: "max",
-          title: inferredTitle,
-          text: maxText,
+          title: res.title,
+          text: res.max_text || res.tg_text,
           format: "post",
           status: "draft",
         },
@@ -510,11 +481,12 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
 
       const updatedItem: ContentItem = {
         ...selectedItem,
-        title: inferredTitle,
-        rubric: inferredRubric,
-        goal: inferredGoal,
-        offer: inferredOffer,
-        trigger_keyword: inferredTrigger,
+        title: res.title,
+        topic: res.topic || promptText,
+        rubric: res.rubric,
+        goal: res.goal,
+        offer: res.offer,
+        trigger_keyword: res.trigger_keyword,
         variants: updatedVariants,
         updated_at: new Date().toISOString(),
       };
@@ -523,31 +495,163 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
         onUpdateContentItem(updatedItem);
       }
 
-      setPostTitle(inferredTitle);
+      setPostTitle(res.title);
 
-      // Set active editor text to the adapted text for current tab
+      updatedVariants.forEach((v) => {
+        onUpdateVariantText(selectedItem.id, v.id, v.text, v.channel);
+      });
+
       if (activeChannelTab === "vk_wall") {
-        setEditorText(vkWallText);
+        setEditorText(res.vk_text);
       } else if (activeChannelTab === "telegram") {
-        setEditorText(tgText);
+        setEditorText(res.tg_text);
       } else if (activeChannelTab === "vk_channel") {
-        setEditorText(vkChannelText);
+        setEditorText(res.vk_channel_text || res.vk_text);
       } else {
-        setEditorText(maxText);
+        setEditorText(res.max_text || res.tg_text);
       }
 
       setSaveStatus("saved");
+      setLastSavedTime(
+        new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+      );
+
       showToast(
         "success",
-        "Параметры и варианты адаптированы!",
-        `Рубрика: «${inferredRubric}», триггер: «${inferredTrigger}». Созданы готовые варианты для VK и Telegram.`
+        "🪄 Пост успешно сгенерирован ИИ!",
+        `Провайдер: ${res.provider === "local_llama" ? "Bonsai 27B (local)" : "OpenAI GPT"}. Рубрика: «${res.rubric}», триггер: «${res.trigger_keyword}». Заполнены варианты для VK и Telegram.`
       );
     } catch (err: any) {
-      showToast("error", "Ошибка адаптации", err.message);
+      showToast("error", "Ошибка генерации контента", err.message);
     } finally {
-      setIsAdaptingAi(false);
+      setIsGeneratingPost(false);
     }
   };
+
+  // 2. Action: «🎯 Разобрать мой текст и заполнить параметры» (БЕЗ стирания авторского текста!)
+  const handleAnalyzeAuthorText = async () => {
+    if (!selectedItem) return;
+
+    const sourceText = editorText.trim();
+    if (!sourceText || sourceText === "Новый пост" || sourceText.length < 8) {
+      showToast(
+        "info",
+        "Текст не найден в редакторе",
+        "Напишите хотя бы пару предложений или тезисы поста в окне редактора, чтобы ИИ мог их разобрать."
+      );
+      return;
+    }
+
+    setIsGeneratingPost(true);
+    try {
+      const res = await analyzeAndAdaptAuthorPost({
+        provider: llmProvider,
+        project: activeProject,
+        authorText: sourceText,
+        existingTitle: postTitle,
+        openaiApiKey,
+      });
+
+      const updatedVariants: ContentVariant[] = [
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "vk_wall")?.id ||
+            `var-${Date.now()}-vk-wall`,
+          content_item_id: selectedItem.id,
+          channel: "vk_wall",
+          title: res.title,
+          text: res.vk_text,
+          format: "post",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "telegram")?.id ||
+            `var-${Date.now()}-tg`,
+          content_item_id: selectedItem.id,
+          channel: "telegram",
+          title: res.title,
+          text: res.tg_text,
+          format: "post",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "vk_channel")?.id ||
+            `var-${Date.now()}-vk-chan`,
+          content_item_id: selectedItem.id,
+          channel: "vk_channel",
+          title: res.title,
+          text: res.vk_channel_text || res.vk_text,
+          format: "article",
+          status: "draft",
+        },
+        {
+          id:
+            selectedItem.variants.find((v) => v.channel === "max")?.id ||
+            `var-${Date.now()}-max`,
+          content_item_id: selectedItem.id,
+          channel: "max",
+          title: res.title,
+          text: res.max_text || res.tg_text,
+          format: "post",
+          status: "draft",
+        },
+      ];
+
+      const resolvedTitle = postTitle && postTitle !== "Новый пост" ? postTitle : res.title;
+      const updatedItem: ContentItem = {
+        ...selectedItem,
+        title: resolvedTitle,
+        rubric: res.rubric,
+        goal: res.goal,
+        offer: res.offer,
+        trigger_keyword: res.trigger_keyword,
+        variants: updatedVariants,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (onUpdateContentItem) {
+        onUpdateContentItem(updatedItem);
+      }
+
+      if (!postTitle || postTitle === "Новый пост") {
+        setPostTitle(resolvedTitle);
+      }
+
+      updatedVariants.forEach((v) => {
+        onUpdateVariantText(selectedItem.id, v.id, v.text, v.channel);
+      });
+
+      if (activeChannelTab === "vk_wall") {
+        setEditorText(res.vk_text);
+      } else if (activeChannelTab === "telegram") {
+        setEditorText(res.tg_text);
+      } else if (activeChannelTab === "vk_channel") {
+        setEditorText(res.vk_channel_text || res.vk_text);
+      } else {
+        setEditorText(res.max_text || res.tg_text);
+      }
+
+      setSaveStatus("saved");
+      setLastSavedTime(
+        new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+      );
+
+      showToast(
+        "success",
+        "🎯 Авторский текст разобран!",
+        `Рубрика: «${res.rubric}», триггер: «${res.trigger_keyword}». Авторский стиль полностью сохранен, варианты для VK и Telegram адаптированы.`
+      );
+    } catch (err: any) {
+      showToast("error", "Ошибка разбора текста", err.message);
+    } finally {
+      setIsGeneratingPost(false);
+    }
+  };
+
+  // Alias for backward compatibility
+  const handleAiAdapt = handleAnalyzeAuthorText;
 
   // 3. Publish Now Action («⚡ Опубликовать сейчас»)
   const handleExecutePublishNow = async () => {
@@ -886,6 +990,53 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
               />
             </div>
 
+            {/* AI Provider Switcher */}
+            <div className="flex items-center gap-1 bg-zinc-100 dark:bg-zinc-800/90 p-1 rounded-lg border border-zinc-200/80 dark:border-zinc-700/80 mr-3">
+              <button
+                type="button"
+                onClick={() => handleSelectProvider("local_llama")}
+                title="Локальная модель Bonsai 27B (http://localhost:8080/v1)"
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
+                  llmProvider === "local_llama"
+                    ? "bg-teal-700 text-white shadow-xs font-semibold"
+                    : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                }`}
+              >
+                <Server size={12} />
+                <span>✨ Bonsai 27B (local)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectProvider("openai")}
+                title="Облачный OpenAI API (gpt-4o-mini)"
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
+                  llmProvider === "openai"
+                    ? "bg-teal-700 text-white shadow-xs font-semibold"
+                    : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                }`}
+              >
+                <Cpu size={12} />
+                <span>🌐 OpenAI GPT</span>
+              </button>
+              {llmProvider === "openai" && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTempApiKey(openaiApiKey);
+                    setShowApiKeyModal(true);
+                  }}
+                  title={openaiApiKey ? "Ключ OpenAI настроен (нажмите для изменения)" : "Укажите ключ OpenAI API"}
+                  className={`p-1 rounded transition-colors cursor-pointer ${
+                    openaiApiKey
+                      ? "text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100/50"
+                      : "text-amber-600 dark:text-amber-400 hover:bg-amber-100/50"
+                  }`}
+                >
+                  <Key size={12} />
+                </button>
+              )}
+            </div>
+
             {/* Clear publishing actions directly in this window! */}
             <div className="flex items-center gap-2 shrink-0">
               {/* Button 1: «⚡ Опубликовать сейчас» */}
@@ -1113,6 +1264,119 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             )}
           </div>
 
+          {/* Collapsible AI Assistant / Post Generator Panel */}
+          <div className="border-b border-zinc-200 dark:border-zinc-800 bg-linear-to-b from-teal-50/40 via-white to-white dark:from-teal-950/20 dark:via-zinc-900 dark:to-zinc-900">
+            <div className="px-6 py-2 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-6 h-6 rounded-md bg-teal-600/10 dark:bg-teal-400/10 flex items-center justify-center text-teal-700 dark:text-teal-300">
+                  <Bot size={15} />
+                </div>
+                <span className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                  AI Ассистент / Генератор постов
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-teal-100/80 dark:bg-teal-900/60 text-teal-800 dark:text-teal-200 font-medium">
+                  {llmProvider === "local_llama" ? "✨ Bonsai 27B (local:8080)" : "🌐 OpenAI GPT-4o-mini"}
+                </span>
+                <span className="text-[10px] text-zinc-600 dark:text-zinc-400 hidden sm:inline">
+                  • База знаний RAG ({activeProject.niche_type})
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsAiPanelOpen(!isAiPanelOpen)}
+                className="flex items-center gap-1 text-[11px] font-medium text-teal-700 dark:text-teal-400 hover:text-teal-800 dark:hover:text-teal-300 transition-colors px-2 py-1 rounded hover:bg-teal-50 dark:hover:bg-zinc-800 cursor-pointer"
+              >
+                <span>{isAiPanelOpen ? "Свернуть панель ИИ" : "Открыть генератор ИИ"}</span>
+                {isAiPanelOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+              </button>
+            </div>
+
+            {isAiPanelOpen && (
+              <div className="px-6 pb-3 pt-1 border-t border-teal-100/60 dark:border-teal-900/40 space-y-2.5">
+                {/* Prompt Textarea */}
+                <div>
+                  <label className="block text-[11px] font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    Опишите идею поста, тезисы или задачу для ИИ:
+                  </label>
+                  <textarea
+                    value={aiPrompt}
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                    placeholder="Например: Расскажи про теневой профиль в санузле 5м² и выгоду перед плиткой, почему натяжной потолок не боится затопов..."
+                    rows={2}
+                    disabled={isGeneratingPost}
+                    className="w-full text-xs px-3 py-2 bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-750 rounded-lg text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-1.5 focus:ring-teal-600 transition-all resize-none shadow-2xs"
+                  />
+                </div>
+
+                {/* Fast Prompt Preset Chips */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[10px] text-zinc-600 dark:text-zinc-400 font-semibold uppercase tracking-wider mr-1">
+                    Быстрые темы:
+                  </span>
+                  {promptPresets.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => setAiPrompt(p.text)}
+                      disabled={isGeneratingPost}
+                      className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-teal-100 dark:hover:bg-teal-900/60 hover:text-teal-800 dark:hover:text-teal-200 border border-zinc-200/80 dark:border-zinc-700/80 transition-all cursor-pointer shadow-2xs disabled:opacity-50"
+                    >
+                      <span>{p.icon}</span>
+                      <span>{p.label}</span>
+                    </button>
+                  ))}
+                </div>
+
+                {/* Main Action Buttons */}
+                <div className="flex items-center justify-between gap-3 pt-1 flex-wrap">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    {/* Action Button 1: Сгенерировать пост с нуля */}
+                    <button
+                      type="button"
+                      onClick={handleGeneratePostFromScratch}
+                      disabled={isGeneratingPost || !aiPrompt.trim()}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold bg-teal-700 hover:bg-teal-800 text-white transition-all shadow-xs cursor-pointer active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                      title="Сгенерировать полноценный пост, варианты для VK и TG, заголовок и параметры с нуля на основе промпта и базы знаний"
+                    >
+                      {isGeneratingPost ? (
+                        <RefreshCw size={13} className="animate-spin" />
+                      ) : (
+                        <Wand2 size={13} />
+                      )}
+                      <span>
+                        {isGeneratingPost ? "ИИ генерирует контент..." : "🪄 Сгенерировать пост с нуля"}
+                      </span>
+                    </button>
+
+                    {/* Action Button 2: Разобрать мой текст и заполнить параметры */}
+                    <button
+                      type="button"
+                      onClick={handleAnalyzeAuthorText}
+                      disabled={isGeneratingPost || !editorText.trim()}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-800 dark:text-zinc-200 border border-zinc-300 dark:border-zinc-700 transition-all shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title="ИИ сохранит ваш авторский стиль и фактуру, выделит рубрику, оффер и подготовит варианты для VK и TG"
+                    >
+                      {isGeneratingPost ? (
+                        <RefreshCw size={13} className="animate-spin" />
+                      ) : (
+                        <Sparkles size={13} />
+                      )}
+                      <span>
+                        {isGeneratingPost ? "ИИ разбирает текст..." : "🎯 Разобрать мой текст и заполнить параметры"}
+                      </span>
+                    </button>
+                  </div>
+
+                  <div className="text-[11px] text-zinc-600 dark:text-zinc-400 flex items-center gap-1">
+                    <Check size={12} className="text-emerald-600 dark:text-emerald-400" />
+                    <span>Авторский текст не стирается • Автоподбор оффера и триггера</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Channel Variant Tabs (VK стена, VK канал, Telegram, MAX) */}
           <div className="px-6 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 flex items-center justify-between overflow-x-auto shrink-0">
             <div className="flex items-center gap-2">
@@ -1146,20 +1410,20 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
             {/* AI Assistant Button in Tabs Bar */}
             <button
               type="button"
-              onClick={handleAiAdapt}
-              disabled={isAdaptingAi}
+              onClick={handleAnalyzeAuthorText}
+              disabled={isGeneratingPost}
               className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-700 hover:to-emerald-700 text-white transition-all shadow-2xs cursor-pointer disabled:opacity-60 active:scale-95 my-1.5"
               title="Нейросеть проанализирует текст, заполнит рубрику, оффер, триггер и адаптирует варианты под VK и Telegram"
             >
-              {isAdaptingAi ? (
+              {isGeneratingPost ? (
                 <RefreshCw size={13} className="animate-spin" />
               ) : (
                 <Sparkles size={13} />
               )}
               <span>
-                {isAdaptingAi
-                  ? "ИИ адаптирует..."
-                  : "🪄 Заполнить параметры и адаптировать через ИИ"}
+                {isGeneratingPost
+                  ? "ИИ разбирает текст..."
+                  : "🎯 Разобрать мой текст через ИИ"}
               </span>
             </button>
           </div>
@@ -1718,6 +1982,58 @@ export const ContentWorkspace: React.FC<ContentWorkspaceProps> = ({
                     setShowMediaPicker(false);
                   }}
                 />
+              </div>
+            </div>
+          )}
+
+          {/* 6. OpenAI API Key Modal */}
+          {showApiKeyModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-2xs">
+              <div className="bg-white dark:bg-zinc-900 rounded-xl shadow-2xl max-w-md w-full p-5 border border-zinc-200 dark:border-zinc-800">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <Key size={16} className="text-teal-600 dark:text-teal-400" />
+                    <h3 className="font-bold text-sm text-zinc-900 dark:text-zinc-100">
+                      Настройка ключа OpenAI API
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKeyModal(false)}
+                    className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 cursor-pointer"
+                  >
+                    <X size={15} />
+                  </button>
+                </div>
+
+                <p className="text-xs text-zinc-600 dark:text-zinc-400 mb-3 leading-relaxed">
+                  Укажите ваш API-ключ OpenAI для генерации контента через модель GPT-4o-mini. Ключ безопасно сохраняется в локальном хранилище вашего браузера (localStorage).
+                </p>
+
+                <input
+                  type="password"
+                  value={tempApiKey}
+                  onChange={(e) => setTempApiKey(e.target.value)}
+                  placeholder="sk-proj-..."
+                  className="w-full px-3 py-2 text-xs bg-zinc-50 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 rounded-lg text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1.5 focus:ring-teal-600 mb-4 font-mono"
+                />
+
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKeyModal(false)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer"
+                  >
+                    Отмена
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveApiKey}
+                    className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-teal-700 hover:bg-teal-800 text-white shadow-2xs cursor-pointer"
+                  >
+                    Сохранить ключ
+                  </button>
+                </div>
               </div>
             </div>
           )}

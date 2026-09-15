@@ -1,5 +1,6 @@
 import { Conversation, Contact, Lead, Message, ChannelType, AiSuggestion } from "../types";
 
+export const TELEGRAM_GATEWAY_URL = "https://feniks-tg-proxy.rabota2x97.workers.dev";
 export const DEFAULT_TELEGRAM_BOT_TOKEN = "8809553443:AAFtT4HoI_dk0bhdGhaISNBnOEDGIYkF3UU";
 export const DEFAULT_TELEGRAM_CHANNEL_ID = "-1003840149202";
 const TG_TOKEN_STORAGE_KEY = "phoenix_tg_token";
@@ -215,7 +216,7 @@ export async function checkTelegramBotStatus(): Promise<{
   }
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+    const res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/getMe`, {
       method: "GET",
       headers: { Accept: "application/json" },
     });
@@ -254,7 +255,7 @@ export async function sendTelegramMessageDirect(
 
   // Попытка 1: с форматированием (HTML)
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -276,7 +277,7 @@ export async function sendTelegramMessageDirect(
 
     // Если ошибка парсинга HTML/Markdown сущностей, пробуем отправить без parse_mode как чистый текст
     if (data?.description && /can't parse entities|tag|entity/i.test(data.description)) {
-      const fallbackRes = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      const fallbackRes = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -350,14 +351,14 @@ export async function getTelegramFileInfo(
   if (!token || !fileId) return null;
   try {
     const res = await fetch(
-      `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`
+      `${TELEGRAM_GATEWAY_URL}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`
     );
     const data = await res.json();
     if (data?.ok && data.result?.file_path) {
       const filePath = data.result.file_path;
       return {
         filePath,
-        directUrl: `https://api.telegram.org/file/bot${token}/${filePath}`,
+        directUrl: `${TELEGRAM_GATEWAY_URL}/file/bot${token}/${filePath}`,
       };
     }
   } catch (err) {
@@ -376,7 +377,7 @@ export async function getTelegramFileDirectUrl(fileId: string): Promise<string |
 
 /**
  * Надежная загрузка медиа через Blob:
- * - Делает fetch к https://api.telegram.org/file/bot<TOKEN>/<filePath> (или полному URL) с таймаутом
+ * - Делает fetch к TELEGRAM_GATEWAY_URL/file/bot<TOKEN>/<filePath> (или полному URL) с таймаутом
  * - При ошибке сети (ERR_CONNECTION_TIMED_OUT) или блокировке автоматически переключается на локальный прокси бэкенда (/api/media/file?url=...)
  * - Получает бинарный response.blob() с корректным MIME-типом (image/jpeg, video/mp4, audio/ogg, application/pdf и др.)
  * - Создает локальный URL через URL.createObjectURL(blob)
@@ -404,7 +405,9 @@ export async function downloadTelegramMediaBlob(
       return null;
     }
     const cleanPath = filePath.replace(/^\/+/, "");
-    fetchUrl = `https://api.telegram.org/file/bot${token}/${cleanPath}`;
+    fetchUrl = `${TELEGRAM_GATEWAY_URL}/file/bot${token}/${cleanPath}`;
+  } else if (fetchUrl.includes("api.telegram.org")) {
+    fetchUrl = fetchUrl.replace("https://api.telegram.org", TELEGRAM_GATEWAY_URL).replace("http://api.telegram.org", TELEGRAM_GATEWAY_URL);
   }
 
   let rawBlob: Blob | null = null;
@@ -563,12 +566,12 @@ export async function sendTelegramPhotoDirect(
         formData.append("caption", trimmedCaption);
         formData.append("parse_mode", parseMode);
       }
-      res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendPhoto`, {
         method: "POST",
         body: formData,
       });
     } else {
-      res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendPhoto`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -599,7 +602,7 @@ export async function sendTelegramPhotoDirect(
         if (trimmedCaption) {
           fallbackFd.append("caption", trimmedCaption);
         }
-        const fallbackRes = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        const fallbackRes = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendPhoto`, {
           method: "POST",
           body: fallbackFd,
         });
@@ -613,7 +616,7 @@ export async function sendTelegramPhotoDirect(
           };
         }
       } else {
-        const fallbackRes = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+        const fallbackRes = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendPhoto`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -690,12 +693,12 @@ export async function sendTelegramDocumentDirect(
         formData.append("caption", trimmedCaption);
         formData.append("parse_mode", parseMode);
       }
-      res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendDocument`, {
         method: "POST",
         body: formData,
       });
     } else {
-      res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      res = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendDocument`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -726,7 +729,7 @@ export async function sendTelegramDocumentDirect(
         if (trimmedCaption) {
           fallbackFd.append("caption", trimmedCaption);
         }
-        const fallbackRes = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+        const fallbackRes = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/sendDocument`, {
           method: "POST",
           body: fallbackFd,
         });
@@ -967,7 +970,7 @@ export async function fetchTelegramUpdatesDirect(
   // 1. Получаем инфо о боте
   let botUsername = "feniks_smmBot";
   try {
-    const meRes = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const meRes = await fetch(`${TELEGRAM_GATEWAY_URL}/bot${token}/getMe`);
     const meData = await meRes.json();
     if (meData?.ok && meData.result?.username) {
       botUsername = meData.result.username;
@@ -990,7 +993,7 @@ export async function fetchTelegramUpdatesDirect(
   // 3. Запрашиваем апдейты через Telegram Bot API
   let updates: any[] = [];
   try {
-    const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&limit=50&timeout=0`;
+    const url = `${TELEGRAM_GATEWAY_URL}/bot${token}/getUpdates?offset=${offset}&limit=50&timeout=0`;
     const res = await fetch(url, { method: "GET" });
     const data = await res.json();
     if (data?.ok && Array.isArray(data.result)) {

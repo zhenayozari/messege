@@ -12,7 +12,7 @@ from app.services.conversation_service import create_inbound_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API_URL = "https://api.telegram.org"
+TELEGRAM_API_URL = "https://feniks-tg-proxy.rabota2x97.workers.dev"
 
 
 def _require_telegram_settings() -> tuple[str, str | None]:

